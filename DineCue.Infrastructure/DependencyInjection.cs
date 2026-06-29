@@ -1,4 +1,5 @@
 using System.IdentityModel.Tokens.Jwt;
+using System.Net;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
@@ -38,10 +39,21 @@ public sealed class EmailOtpOptions
     public int EmailWindowMinutes { get; set; } = 15;
 }
 
+public sealed class EmailOptions
+{
+    public string Provider { get; set; } = "none";
+    public string FromEmail { get; set; } = "";
+    public string FromName { get; set; } = "DineCue";
+    public string ResendApiKey { get; set; } = "";
+    public string AppBaseUrl { get; set; } = "";
+    public bool Enabled { get; set; }
+    public int TimeoutSeconds { get; set; } = 10;
+}
+
 public sealed class GooglePlacesOptions
 {
     public string ApiKey { get; set; } = "";
-    public int MaxCandidates { get; set; } = 12;
+    public int MaxCandidates { get; set; } = 24;
     public int DefaultRadiusMeters { get; set; } = 2500;
     public int RequestTimeoutSeconds { get; set; } = 12;
 }
@@ -75,6 +87,7 @@ public static class DependencyInjection
         services.AddMemoryCache();
         services.Configure<JwtOptions>(configuration.GetSection("Jwt"));
         services.Configure<EmailOtpOptions>(configuration.GetSection("EmailOtp"));
+        services.Configure<EmailOptions>(configuration.GetSection("Email"));
         services.Configure<GooglePlacesOptions>(configuration.GetSection("GooglePlaces"));
         services.Configure<OpenAIOptions>(configuration.GetSection("OpenAI"));
         services.Configure<RecommendationOptions>(configuration.GetSection("Recommendation"));
@@ -158,7 +171,25 @@ public static class DependencyInjection
         }
         services.AddScoped<ISubscriptionProvider, MockSubscriptionProvider>();
         services.AddScoped<OtpRateLimiter>();
-        services.AddSingleton<IEmailSender>(_ => new MockEmailSender(environment));
+        services.AddSingleton<IEmailTemplateRenderer, EmailTemplateRenderer>();
+        var emailOptions = configuration.GetSection("Email").Get<EmailOptions>() ?? new EmailOptions();
+        if (emailOptions.Enabled && emailOptions.Provider.Equals("resend", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(configuration["Email:ResendApiKey"]))
+                throw new InvalidOperationException("Email provider is not configured. Set Email:ResendApiKey using user-secrets or environment variables.");
+            if (string.IsNullOrWhiteSpace(emailOptions.FromEmail))
+                throw new InvalidOperationException("Email:FromEmail must be configured when email delivery is enabled.");
+            services.AddHttpClient<ResendEmailSender>((sp, client) =>
+            {
+                var options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<EmailOptions>>().Value;
+                client.Timeout = TimeSpan.FromSeconds(Math.Clamp(options.TimeoutSeconds, 1, 60));
+            });
+            services.AddTransient<IEmailSender>(sp => sp.GetRequiredService<ResendEmailSender>());
+        }
+        else
+        {
+            services.AddSingleton<IEmailSender, DevelopmentEmailSender>();
+        }
         services.AddSingleton<IGoogleAuthValidator>(_ => new MockGoogleAuthValidator(environment));
         services.AddSingleton<ITokenService, TokenService>();
         services.AddSingleton<IPlacesProvider, MockPlacesProvider>();
@@ -488,7 +519,7 @@ internal sealed class AuthService(
     {
         if (request == null) throw new ApiException("validation_error", "Request body is required.", 400, new { field = "body" });
         var email = NormalizeEmail(request.Email);
-        _ = RequestValidation.PreferredLanguageOrDefault(request.PreferredLanguage);
+        var preferredLanguage = RequestValidation.PreferredLanguageOrDefault(request.PreferredLanguage);
         otpRateLimiter.CheckStart(email);
         var code = RandomNumberGenerator.GetInt32(100000, 999999).ToString();
         var now = DateTimeOffset.UtcNow;
@@ -502,7 +533,7 @@ internal sealed class AuthService(
             CreatedAt = now
         });
         await db.SaveChangesAsync(ct);
-        await emailSender.SendOtpAsync(email, code, ct);
+        _ = await emailSender.SendOtpAsync(email, code, preferredLanguage, ct);
         return new EmailStartResponse("If the email can receive a code, an OTP has been sent.", environment.IsDevelopment() && otpOptions.Value.ExposeDevOtp ? code : null);
     }
 
@@ -996,7 +1027,8 @@ internal sealed class RecommendationProcessor(
             await db.RecommendationResults.Where(x => x.SessionId == session.Id).ExecuteDeleteAsync(ct);
             await db.RecommendationCandidates.Where(x => x.SessionId == session.Id).ExecuteDeleteAsync(ct);
             var candidateById = candidates.ToDictionary(x => x.ProviderPlaceId, StringComparer.OrdinalIgnoreCase);
-            foreach (var recommendation in reasoning.Recommendations.OrderBy(x => x.Rank).Take(3))
+            var sparseResultNote = candidates.Count < 3 ? SparseResultNote(session.Language) : null;
+            foreach (var recommendation in reasoning.Recommendations.OrderBy(x => x.Rank).Take(5))
             {
                 if (!candidateById.TryGetValue(recommendation.PlaceId, out var place))
                     throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
@@ -1026,7 +1058,7 @@ internal sealed class RecommendationProcessor(
                 var vibe = DisplayText.CleanUiText(DisplayText.JoinPhraseList(recommendation.BestFor), false);
                 var summary = DisplayText.CleanUiText(recommendation.Reason, true);
                 var whyThisPlace = DisplayText.CleanUiText(DisplayText.JoinSentenceList(recommendation.WhyItFits), true);
-                var goodToKnow = DisplayText.BuildCardGoodToKnow(reasoning.Summary, recommendation.WhyItFits, recommendation.WatchOut);
+                var goodToKnow = sparseResultNote ?? DisplayText.BuildCardGoodToKnow(reasoning.Summary, recommendation.WhyItFits, recommendation.WatchOut);
                 var cautions = recommendation.WatchOut.Select(x => DisplayText.CleanUiText(x, true)).Where(x => !string.IsNullOrWhiteSpace(x)).ToArray();
                 var shareText = DisplayText.CleanUiText($"{place.Name}: {recommendation.Label}", false);
                 DisplayText.ValidateRecommendationUiCopy(headline, vibe, summary, whyThisPlace, goodToKnow, cautions, shareText);
@@ -1059,10 +1091,14 @@ internal sealed class RecommendationProcessor(
             await db.SaveChangesAsync(ct);
             await notifier.CompletedAsync(session.UserId, new RecommendationStatusChanged(session.Id, session.Status, session.CurrentStep), ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            logger.LogWarning(ex, "Recommendation job failed for session {SessionId}", job.SessionId);
+            throw;
+        }
+        catch (Exception ex)
+        {
             var failure = ex as ProviderFailureException;
+            logger.LogWarning(ex, "Recommendation job failed for session {SessionId} with {FailureType} and {ErrorCode}", job.SessionId, ex.GetType().Name, failure?.Code ?? "recommendation_failed");
             await MarkFailedAsync(session, failure?.Code ?? "recommendation_failed", failure?.ClientMessage ?? "We could not complete this recommendation right now.", ct);
         }
     }
@@ -1093,6 +1129,13 @@ internal sealed class RecommendationProcessor(
             saved.Select(x => new SavedPlaceDto(x.Id, x.Provider, x.ProviderPlaceId, x.RecommendationResultId, x.Name, x.Address, x.Note, x.CreatedAt)).ToList(),
             history);
     }
+
+    private static string SparseResultNote(string language) => language switch
+    {
+        "tr" => "Bu istek için yalnızca birkaç güçlü eşleşme buldum; bu yüzden listeyi gerçekçi tuttum.",
+        "de" => "Für diese Suche habe ich nur wenige starke Treffer gefunden, deshalb bleibt die Auswahl bewusst kurz.",
+        _ => "I found only a few strong matches for this request, so I kept the list honest and focused."
+    };
 
     private static void ApplyFamilyContextSignals(Dictionary<string, object> normalized, string[] cues, Dictionary<string, object> context, bool usuallyWithKids)
     {
@@ -1200,10 +1243,43 @@ internal sealed class RecommendationProcessingWorker(
                 var processor = scope.ServiceProvider.GetRequiredService<RecommendationProcessor>();
                 await processor.ProcessAsync(job, stoppingToken);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                logger.LogError(ex, "Unhandled recommendation worker error for session {SessionId}", job.SessionId);
+                break;
             }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Unhandled recommendation worker error for session {SessionId} with {FailureType}", job.SessionId, ex.GetType().Name);
+                await MarkUnhandledJobFailedAsync(job, ex, stoppingToken);
+            }
+        }
+    }
+
+    private async Task MarkUnhandledJobFailedAsync(RecommendationJob job, Exception ex, CancellationToken stoppingToken)
+    {
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<DineCueDbContext>();
+            var notifier = scope.ServiceProvider.GetRequiredService<IRecommendationStatusNotifier>();
+            var session = await db.RecommendationSessions.FirstOrDefaultAsync(x => x.Id == job.SessionId && x.UserId == job.UserId, stoppingToken);
+            if (session == null || session.Status is "completed" or "failed" or "cancelled") return;
+
+            var failure = ex as ProviderFailureException;
+            session.Status = "failed";
+            session.CurrentStep = null;
+            session.FailedAt = DateTimeOffset.UtcNow;
+            session.ErrorCode = failure?.Code ?? "recommendation_failed";
+            session.ErrorMessage = failure?.ClientMessage ?? "We could not complete this recommendation right now.";
+            await db.SaveChangesAsync(stoppingToken);
+            await notifier.FailedAsync(session.UserId, new RecommendationFailedEvent(session.Id, session.Status, session.ErrorCode, session.ErrorMessage), stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception markFailedError)
+        {
+            logger.LogWarning(markFailedError, "Could not mark recommendation session {SessionId} failed after worker error.", job.SessionId);
         }
     }
 
@@ -1241,6 +1317,122 @@ internal sealed class ProviderFailureException(string code, string clientMessage
     public string? RepairFeedback { get; } = repairFeedback;
 }
 
+public static class RecommendationCandidateSearchPlanner
+{
+    public static IReadOnlyList<string> BuildQueries(DiningIntent intent)
+    {
+        var raw = Clean(intent.RawText);
+        var location = Clean(intent.Location.Text);
+        var cues = intent.SelectedCues.Select(Clean).Where(x => x.Length > 0).ToArray();
+        var contextTerms = intent.Context
+            .Where(x => x.Value is not null)
+            .Select(x => Clean(x.Value.ToString()))
+            .Where(x => x.Length > 0 && x.Length <= 40)
+            .Take(5)
+            .ToArray();
+
+        var terms = new List<string>();
+        Add(terms, raw);
+        Add(terms, MealMoment(intent, raw));
+        Add(terms, FamilyTerm(cues, contextTerms));
+        Add(terms, BudgetTerm(cues, contextTerms));
+        Add(terms, AtmosphereTerm(cues, contextTerms));
+        Add(terms, CuisineTerm(cues, contextTerms, raw));
+
+        var queries = new List<string>();
+        Add(queries, Join(raw, location));
+        Add(queries, Join(CuisineTerm(cues, contextTerms, raw), "local food", location));
+        Add(queries, Join(FamilyTerm(cues, contextTerms), MealMoment(intent, raw), location));
+        Add(queries, Join(BudgetTerm(cues, contextTerms), "restaurant", location));
+        Add(queries, Join(AtmosphereTerm(cues, contextTerms), "restaurant", location));
+        Add(queries, Join(string.Join(" ", terms.Where(x => x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).Take(5)), location));
+
+        return queries
+            .Where(x => x.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(6)
+            .ToArray();
+    }
+
+    public static IReadOnlyList<PlaceCandidate> Deduplicate(IEnumerable<PlaceCandidate> candidates)
+    {
+        var byId = new Dictionary<string, PlaceCandidate>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate.ProviderPlaceId)) continue;
+            if (!byId.TryGetValue(candidate.ProviderPlaceId, out var existing) || RichnessScore(candidate) > RichnessScore(existing))
+                byId[candidate.ProviderPlaceId] = candidate;
+        }
+        return byId.Values.ToList();
+    }
+
+    private static int RichnessScore(PlaceCandidate value)
+    {
+        var score = 0;
+        if (!string.IsNullOrWhiteSpace(value.Name)) score += 2;
+        if (!string.IsNullOrWhiteSpace(value.Address)) score += 2;
+        if (value.Rating is not null) score += 2;
+        if (value.RatingCount is not null) score += 2;
+        if (value.PriceLevel is not null) score += 1;
+        if (!string.IsNullOrWhiteSpace(value.RawPayloadJson) && value.RawPayloadJson.Length > 8) score += 1;
+        return score;
+    }
+
+    private static string MealMoment(DiningIntent intent, string raw)
+    {
+        if (ContainsAny(raw, "breakfast", "kahvaltı", "frühstück")) return "breakfast";
+        if (ContainsAny(raw, "lunch", "öğle", "mittag")) return "lunch";
+        if (ContainsAny(raw, "coffee", "kahve", "kaffee")) return "coffee";
+        if (ContainsAny(raw, "drink", "bar", "içki", "getränk")) return "drinks";
+        if (ContainsAny(raw, "dessert", "tatlı", "dessert")) return "dessert";
+        return intent.Context.TryGetValue("mealMoment", out var value) ? Clean(value?.ToString()) : "dinner";
+    }
+
+    private static string FamilyTerm(IEnumerable<string> cues, IEnumerable<string> contextTerms) =>
+        cues.Concat(contextTerms).Any(x => ContainsAny(x, "family", "kids", "children", "çocuk", "aile", "kind", "familie"))
+            ? "family restaurant"
+            : "";
+
+    private static string BudgetTerm(IEnumerable<string> cues, IEnumerable<string> contextTerms) =>
+        cues.Concat(contextTerms).Any(x => ContainsAny(x, "budget", "value", "cheap", "uygun", "pahalı", "preis", "günstig"))
+            ? "good value restaurant"
+            : "";
+
+    private static string AtmosphereTerm(IEnumerable<string> cues, IEnumerable<string> contextTerms)
+    {
+        var all = cues.Concat(contextTerms).ToArray();
+        if (all.Any(x => ContainsAny(x, "quiet", "sakin", "ruhig"))) return "relaxed restaurant";
+        if (all.Any(x => ContainsAny(x, "outdoor", "terrace", "dış", "teras", "garten"))) return "outdoor seating restaurant";
+        if (all.Any(x => ContainsAny(x, "premium", "special", "özel", "fein"))) return "premium restaurant";
+        return "";
+    }
+
+    private static string CuisineTerm(IEnumerable<string> cues, IEnumerable<string> contextTerms, string raw)
+    {
+        var all = cues.Concat(contextTerms).Append(raw).ToArray();
+        if (all.Any(x => ContainsAny(x, "local", "traditional", "yerel", "lokal", "traditionell"))) return "local traditional restaurant";
+        if (all.Any(x => ContainsAny(x, "seafood", "balık", "fish", "fisch"))) return "seafood restaurant";
+        if (all.Any(x => ContainsAny(x, "meat", "grill", "köfte", "kebab", "et"))) return "grill restaurant";
+        if (all.Any(x => ContainsAny(x, "vegetarian", "vegan", "vejetaryen"))) return "vegetarian restaurant";
+        return "local restaurant";
+    }
+
+    private static void Add(List<string> values, string value)
+    {
+        value = Clean(value);
+        if (value.Length > 0) values.Add(value);
+    }
+
+    private static string Join(params string[] values) =>
+        string.Join(" ", values.Select(Clean).Where(x => x.Length > 0));
+
+    private static string Clean(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? "" : Regex.Replace(value.Trim(), @"\s+", " ");
+
+    private static bool ContainsAny(string value, params string[] terms) =>
+        terms.Any(term => value.Contains(term, StringComparison.OrdinalIgnoreCase));
+}
+
 internal sealed class GooglePlacesProvider(
     HttpClient http,
     Microsoft.Extensions.Options.IOptions<GooglePlacesOptions> options,
@@ -1257,37 +1449,55 @@ internal sealed class GooglePlacesProvider(
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.RequestTimeoutSeconds, 1, 60)));
         var requestCt = timeoutCts.Token;
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, BuildEndpoint(intent));
-        request.Headers.TryAddWithoutValidation("X-Goog-Api-Key", config.ApiKey);
-        request.Headers.TryAddWithoutValidation("X-Goog-FieldMask", "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.priceLevel,places.types,places.primaryType,places.googleMapsUri,places.websiteUri,places.currentOpeningHours.openNow,places.businessStatus");
-        request.Content = new StringContent(BuildRequestBody(intent, config), Encoding.UTF8, "application/json");
+        var poolLimit = Math.Clamp(config.MaxCandidates, 15, 30);
+        var perQueryLimit = Math.Clamp((int)Math.Ceiling(poolLimit / 3.0), 5, 10);
+        var queries = RecommendationCandidateSearchPlanner.BuildQueries(intent).Take(5).ToArray();
+        var candidates = new List<PlaceCandidate>();
 
         try
         {
-            using var response = await http.SendAsync(request, requestCt);
-            logger.LogInformation("Google Places search completed with status {StatusCode}", (int)response.StatusCode);
-            if (!response.IsSuccessStatusCode)
-                throw new ProviderFailureException("places_provider_failed", "We could not search places right now.");
-
-            await using var stream = await response.Content.ReadAsStreamAsync(requestCt);
-            var json = await JsonNode.ParseAsync(stream, cancellationToken: requestCt);
-            var places = json?["places"]?.AsArray();
-            if (places == null) return [];
-
-            var candidates = new List<PlaceCandidate>();
-            foreach (var place in places)
+            foreach (var query in queries)
             {
-                var candidate = NormalizePlace(place);
-                if (candidate == null) continue;
-                candidates.Add(candidate);
-                if (candidates.Count >= Math.Clamp(config.MaxCandidates, 1, 20)) break;
+                using var request = new HttpRequestMessage(HttpMethod.Post, "https://places.googleapis.com/v1/places:searchText");
+                request.Headers.TryAddWithoutValidation("X-Goog-Api-Key", config.ApiKey);
+                request.Headers.TryAddWithoutValidation("X-Goog-FieldMask", "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.priceLevel,places.types,places.primaryType,places.googleMapsUri,places.websiteUri,places.currentOpeningHours.openNow,places.businessStatus");
+                request.Content = new StringContent(BuildTextSearchRequestBody(intent, query, config, perQueryLimit), Encoding.UTF8, "application/json");
+
+                using var response = await http.SendAsync(request, requestCt);
+                logger.LogInformation("Google Places search completed with status {StatusCode}", (int)response.StatusCode);
+                if (!response.IsSuccessStatusCode)
+                    throw new ProviderFailureException("places_provider_failed", "We could not search places right now.");
+
+                await using var stream = await response.Content.ReadAsStreamAsync(requestCt);
+                var json = await JsonNode.ParseAsync(stream, cancellationToken: requestCt);
+                var places = json?["places"]?.AsArray();
+                if (places == null) continue;
+
+                foreach (var place in places)
+                {
+                    var candidate = NormalizePlace(place);
+                    if (candidate == null) continue;
+                    candidates.Add(candidate);
+                }
+
+                if (RecommendationCandidateSearchPlanner.Deduplicate(candidates).Count >= poolLimit)
+                    break;
             }
-            return candidates;
+
+            return RecommendationCandidateSearchPlanner.Deduplicate(candidates)
+                .OrderByDescending(x => x.RatingCount ?? 0)
+                .ThenByDescending(x => x.Rating ?? 0)
+                .Take(poolLimit)
+                .ToList();
         }
         catch (ProviderFailureException)
         {
             throw;
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "Google Places search timed out.");
+            throw new ProviderFailureException("places_provider_failed", "We could not search places right now.", ex);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -1296,41 +1506,15 @@ internal sealed class GooglePlacesProvider(
         }
     }
 
-    private static string BuildEndpoint(DiningIntent intent)
+    private static string BuildTextSearchRequestBody(DiningIntent intent, string query, GooglePlacesOptions config, int maxResults)
     {
-        var broad = string.IsNullOrWhiteSpace(intent.RawText) || intent.RawText.Trim().Length < 24;
-        return intent.Location.Lat is not null && intent.Location.Lng is not null && broad
-            ? "https://places.googleapis.com/v1/places:searchNearby"
-            : "https://places.googleapis.com/v1/places:searchText";
-    }
-
-    private static string BuildRequestBody(DiningIntent intent, GooglePlacesOptions config)
-    {
-        if (BuildEndpoint(intent).EndsWith("searchNearby", StringComparison.Ordinal))
-        {
-            return JsonText.Serialize(new
-            {
-                includedTypes = new[] { "restaurant", "cafe", "bar" },
-                maxResultCount = Math.Clamp(config.MaxCandidates, 1, 20),
-                locationRestriction = new
-                {
-                    circle = new
-                    {
-                        center = new { latitude = intent.Location.Lat, longitude = intent.Location.Lng },
-                        radius = Math.Clamp(config.DefaultRadiusMeters, 100, 50000)
-                    }
-                },
-                rankPreference = "POPULARITY",
-                languageCode = intent.Language
-            });
-        }
-
-        var queryParts = new[] { intent.RawText, intent.Location.Text, "restaurant cafe bar" }
-            .Where(x => !string.IsNullOrWhiteSpace(x));
+        var queryParts = new[] { query, intent.Location.Text, "restaurant cafe bar" }
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
         var body = new Dictionary<string, object?>
         {
             ["textQuery"] = string.Join(" ", queryParts),
-            ["maxResultCount"] = Math.Clamp(config.MaxCandidates, 1, 20),
+            ["maxResultCount"] = Math.Clamp(maxResults, 1, 20),
             ["languageCode"] = intent.Language
         };
         if (intent.Location.Lat is not null && intent.Location.Lng is not null)
@@ -1465,6 +1649,11 @@ internal sealed class OpenAIRecommendationReasoner(
         {
             throw;
         }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "OpenAI recommendation call timed out.");
+            throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.", ex);
+        }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(ex, "OpenAI recommendation call failed.");
@@ -1472,23 +1661,24 @@ internal sealed class OpenAIRecommendationReasoner(
         }
     }
 
-    private static string BuildPrompt(DiningIntent intent, IReadOnlyList<PlaceCandidate> candidates, bool repair, string? repairFeedback)
+    internal static string BuildPrompt(DiningIntent intent, IReadOnlyList<PlaceCandidate> candidates, bool repair, string? repairFeedback)
     {
         var prompt = new
         {
-            instruction = repair ? "Repair the previous invalid output. Return valid JSON exactly matching the schema. Proofread all UI-facing fields. Fix missing spaces, especially in Turkish. Do not concatenate Turkish words. Do not change selected placeIds. Do not invent new restaurants. Do not change ranks unless necessary. Keep the same structured JSON shape. Remove internal/backend wording, awkward tone, missing spaces, punctuation problems, and robotic fragments." : "Rank up to 3 candidates and write copy that can be shown directly in the UI. Before returning JSON, proofread all visible text for missing spaces and natural punctuation.",
+            instruction = repair ? "Repair the previous invalid output. Return valid JSON exactly matching the schema. Proofread all UI-facing fields. Fix missing spaces, especially in Turkish. Do not concatenate Turkish words. Do not change selected placeIds. Do not invent new restaurants. Do not change ranks unless necessary. Keep the same structured JSON shape. Remove internal/backend wording, awkward tone, missing spaces, punctuation problems, and robotic fragments." : "Rank 3 to 5 candidates when enough real candidates are available. If only 1 or 2 strong candidates exist, return only those and say naturally that the list is intentionally short. Write copy that can be shown directly in the UI. Before returning JSON, proofread all visible text for missing spaces and natural punctuation.",
             repairFeedback = repair ? repairFeedback : null,
             copyRules = new
             {
                 summary = "Short assistant note for the whole set. Speak directly and naturally. Do not mention users, requests, sessions, providers, candidates, criteria, or data.",
                 label = "Short friendly label, localized naturally. Avoid technical labels.",
                 reason = "One polished direct-display sentence or two short sentences. It should sound like a dining assistant, not an analysis.",
-                whyItFits = "Array of 2-4 natural short sentences or sentence-like clauses. Each item must stand alone with natural spacing and punctuation. Avoid raw fragments that would become robotic if joined.",
+                whyItFits = "Array of 2-4 natural short sentences or sentence-like clauses. Each item must stand alone with natural spacing and punctuation. Avoid raw fragments that would become robotic if joined. Explain tradeoffs honestly.",
                 bestFor = "Array of 1-3 short UI labels for vibe/use case. Do not overclaim beyond candidate metadata.",
                 watchOut = "Array of short, human, useful cautions. Use careful wording for uncertain family, quietness, price, crowd, opening, or reservation claims.",
                 goodToKnow = "The summary field doubles as goodToKnow in the API, so make it read like a short assistant note, not a technical explanation.",
                 foodStyle = "If mentioning food style, phrase it as an expectation from the place name/types, not a factual menu claim.",
-                menu = "Do not invent menu items. Leave exact food suggestions out unless real menu data is provided."
+                menu = "Do not invent menu items. Leave exact food suggestions out unless real menu data is provided.",
+                sparseResults = "If fewer than 3 strong choices exist, say this naturally without mentioning backend, APIs, providers, or search internals."
             },
             bannedUiPhrases = DisplayText.ForbiddenPhrases,
             toneExamples = new
@@ -1522,7 +1712,7 @@ internal sealed class OpenAIRecommendationReasoner(
             {
                 summary = "string",
                 interpretedIntent = new { mealMoment = "breakfast|lunch|dinner|coffee|drinks|dessert|unknown", vibe = "string", constraints = new[] { "string" }, language = "en|de|tr" },
-                recommendations = new[] { new { placeId = "string", rank = 1, label = "short localized headline", matchScore = 0, reason = "string", whyItFits = new[] { "string" }, watchOut = new[] { "string" }, bestFor = new[] { "string" }, confidence = "low|medium|high" } }
+                recommendations = new[] { new { placeId = "string from candidates only", rank = 1, label = "short localized headline", matchScore = 0, reason = "string", whyItFits = new[] { "string" }, watchOut = new[] { "string" }, bestFor = new[] { "string" }, confidence = "low|medium|high" } }
             },
             request = new { intent.RawText, intent.Language, intent.SelectedCues, intent.Context, location = intent.Location },
             profile = new { intent.Profile, intent.TasteProfile, intent.DiningProfile },
@@ -1558,7 +1748,7 @@ internal sealed class OpenAIRecommendationReasoner(
         var ranks = new HashSet<int>();
         var language = result.InterpretedIntent.TryGetValue("language", out var value) ? value?.ToString() : null;
         _ = SupportedLanguages.NormalizeRequired(language);
-        if (result.Recommendations.Count is < 1 or > 3)
+        if (result.Recommendations.Count is < 1 or > 5)
             throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
         DisplayText.ValidateModelCopy("summary", result.Summary, requireSentence: true);
         foreach (var rec in result.Recommendations)
@@ -1816,7 +2006,7 @@ internal sealed class MockRecommendationReasoner(IAiPlaceRanker ranker) : IRecom
         return new RecommendationReasoningResult(
             "Mock ranking completed.",
             new Dictionary<string, object> { ["mealMoment"] = "unknown", ["vibe"] = "mock", ["constraints"] = Array.Empty<string>(), ["language"] = intent.Language },
-            ranked.Take(3).Select(x => new ReasonedRecommendation(x.Candidate.ProviderPlaceId, x.Rank, x.Headline, (int)Math.Round(x.Confidence * 100), x.Summary, [x.Why], x.Cautions, [x.Vibe], x.Confidence > 0.8 ? "high" : "medium")).ToList());
+            ranked.Take(5).Select(x => new ReasonedRecommendation(x.Candidate.ProviderPlaceId, x.Rank, x.Headline, (int)Math.Round(x.Confidence * 100), x.Summary, [x.Why], x.Cautions, [x.Vibe], x.Confidence > 0.8 ? "high" : "medium")).ToList());
     }
 }
 
@@ -1922,13 +2112,172 @@ internal sealed class InteractionEventService(DineCueDbContext db) : IInteractio
     private static Guid? ParseGuidOrNull(string value) => Guid.TryParse(value, out var id) ? id : null;
 }
 
-internal sealed class MockEmailSender(IHostEnvironment environment) : IEmailSender
+public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
 {
-    public Task SendOtpAsync(string email, string code, CancellationToken cancellationToken)
+    public RenderedEmailTemplate RenderWelcome(EmailTemplateModel model)
     {
-        if (environment.IsDevelopment())
-            Console.WriteLine($"DineCue dev OTP for {email}: {code}");
-        return Task.CompletedTask;
+        var locale = NormalizeLocale(model.Locale);
+        var name = DisplayName(model.DisplayName, locale);
+        var copy = locale switch
+        {
+            "tr" => ("DineCue'ya hoş geldin", $"Merhaba {name}, DineCue yanında. Sana daha iyi sofralar, daha rahat seçimler ve daha keyifli anlar bulmanda yardımcı olacağız.", "DineCue'ya hoş geldin."),
+            "de" => ("Willkommen bei DineCue", $"Hallo {name}, DineCue ist an deiner Seite. Wir helfen dir, entspannter gute Orte und schöne Genussmomente zu finden.", "Willkommen bei DineCue."),
+            _ => ("Welcome to DineCue", $"Hi {name}, DineCue is here for you. We will help you find better tables, easier choices, and more memorable meals.", "Welcome to DineCue.")
+        };
+        return Layout(locale, copy.Item1, copy.Item2, copy.Item3);
+    }
+
+    public RenderedEmailTemplate RenderEmailVerification(EmailTemplateModel model)
+    {
+        var locale = NormalizeLocale(model.Locale);
+        var minutes = Math.Max(1, model.ExpiresInMinutes ?? 5);
+        var code = WebUtility.HtmlEncode(model.Code ?? "");
+        var copy = locale switch
+        {
+            "tr" => ("Giriş kodun", $"DineCue'ya devam etmek için kodunu kullan: {code}. Bu kod {minutes} dakika boyunca geçerli.", "Bu isteği sen başlatmadıysan bu e-postayı yok sayabilirsin."),
+            "de" => ("Dein Anmeldecode", $"Nutze diesen Code, um mit DineCue fortzufahren: {code}. Er ist {minutes} Minuten gültig.", "Wenn du das nicht warst, kannst du diese E-Mail einfach ignorieren."),
+            _ => ("Your sign-in code", $"Use this code to continue with DineCue: {code}. It is valid for {minutes} minutes.", "If this was not you, you can ignore this email.")
+        };
+        return Layout(locale, copy.Item1, copy.Item2, copy.Item3);
+    }
+
+    public RenderedEmailTemplate RenderContactFeedbackNotification(EmailTemplateModel model)
+    {
+        var locale = NormalizeLocale(model.Locale);
+        var sender = string.IsNullOrWhiteSpace(model.SenderEmail) ? "" : model.SenderEmail.Trim();
+        var message = string.IsNullOrWhiteSpace(model.Message) ? "" : model.Message.Trim();
+        var copy = locale switch
+        {
+            "tr" => ("Yeni DineCue mesajı", "DineCue için yeni bir mesaj geldi.", "Yanıtlamadan önce mesajı dikkatlice gözden geçirmek iyi olur."),
+            "de" => ("Neue Nachricht für DineCue", "Für DineCue ist eine neue Nachricht eingegangen.", "Bitte lies die Nachricht aufmerksam, bevor du antwortest."),
+            _ => ("New message for DineCue", "A new message has arrived for DineCue.", "Please review it with care before replying.")
+        };
+        var details = locale switch
+        {
+            "tr" => $"Gönderen: {sender}\n\nMesaj:\n{message}",
+            "de" => $"Absender: {sender}\n\nNachricht:\n{message}",
+            _ => $"From: {sender}\n\nMessage:\n{message}"
+        };
+        return Layout(locale, copy.Item1, $"{copy.Item2}\n\n{details}", copy.Item3);
+    }
+
+    public static string NormalizeLocale(string? locale) => locale?.Trim().ToLowerInvariant() switch
+    {
+        "tr" => "tr",
+        "de" => "de",
+        _ => "en"
+    };
+
+    private static string DisplayName(string? value, string locale)
+    {
+        if (!string.IsNullOrWhiteSpace(value)) return WebUtility.HtmlEncode(value.Trim());
+        return locale switch { "tr" => "Merhaba", "de" => "du", _ => "there" };
+    }
+
+    private static RenderedEmailTemplate Layout(string locale, string subject, string body, string note, (string Label, string Url)? action = null)
+    {
+        var title = WebUtility.HtmlEncode(subject);
+        var bodyHtml = WebUtility.HtmlEncode(body);
+        var noteHtml = WebUtility.HtmlEncode(note);
+        var actionHtml = action is null
+            ? ""
+            : $"""<p style="margin:28px 0"><a href="{action.Value.Url}" style="background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:8px;display:inline-block">{WebUtility.HtmlEncode(action.Value.Label)}</a></p>""";
+        var html = $$"""
+<!doctype html>
+<html lang="{{locale}}">
+<body style="margin:0;background:#f7f3ee;font-family:Inter,Segoe UI,Arial,sans-serif;color:#1f2933">
+  <div style="max-width:560px;margin:0 auto;padding:32px 20px">
+    <div style="background:#ffffff;border-radius:14px;padding:32px;border:1px solid #eadfd2">
+      <p style="margin:0 0 20px;color:#9a6b3f;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:12px">DineCue</p>
+      <h1 style="margin:0 0 16px;font-size:24px;line-height:1.25;color:#161a1d">{{title}}</h1>
+      <p style="margin:0 0 18px;font-size:16px;line-height:1.6">{{bodyHtml}}</p>
+      {{actionHtml}}
+      <p style="margin:24px 0 0;font-size:14px;line-height:1.5;color:#667085">{{noteHtml}}</p>
+    </div>
+  </div>
+</body>
+</html>
+""";
+        var text = action is null
+            ? $"{subject}\n\n{body}\n\n{note}"
+            : $"{subject}\n\n{body}\n\n{action.Value.Label}: {action.Value.Url}\n\n{note}";
+        return new RenderedEmailTemplate(subject, html, text);
+    }
+}
+
+public sealed class DevelopmentEmailSender(
+    IEmailTemplateRenderer templates,
+    Microsoft.Extensions.Options.IOptions<EmailOtpOptions> otpOptions,
+    ILogger<DevelopmentEmailSender> logger) : IEmailSender
+{
+    public Task<EmailSendResult> SendAsync(EmailMessage message, CancellationToken cancellationToken)
+    {
+        logger.LogInformation("Email delivery disabled. Suppressed email to {RecipientHash} with subject {Subject}.", HashRecipient(message.To), message.Subject);
+        return Task.FromResult(new EmailSendResult(true, ErrorCode: "email_disabled"));
+    }
+
+    public Task<EmailSendResult> SendOtpAsync(string email, string code, string? locale, CancellationToken cancellationToken)
+    {
+        var rendered = templates.RenderEmailVerification(new EmailTemplateModel(locale ?? "en", Code: code, ExpiresInMinutes: otpOptions.Value.ExpiryMinutes));
+        return SendAsync(new EmailMessage(email, rendered.Subject, rendered.HtmlBody, rendered.TextBody, EmailTemplateRenderer.NormalizeLocale(locale), new Dictionary<string, string> { ["template"] = "email_verification" }), cancellationToken);
+    }
+
+    private static string HashRecipient(string email) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(email.Trim().ToLowerInvariant())))[..12].ToLowerInvariant();
+}
+
+public sealed class ResendEmailSender(
+    HttpClient http,
+    Microsoft.Extensions.Options.IOptions<EmailOptions> options,
+    Microsoft.Extensions.Options.IOptions<EmailOtpOptions> otpOptions,
+    IEmailTemplateRenderer templates,
+    ILogger<ResendEmailSender> logger) : IEmailSender
+{
+    public async Task<EmailSendResult> SendAsync(EmailMessage message, CancellationToken cancellationToken)
+    {
+        var config = options.Value;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.TimeoutSeconds, 1, 60)));
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.resend.com/emails");
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ResendApiKey);
+        request.Content = new StringContent(JsonText.Serialize(new
+        {
+            from = $"{config.FromName} <{config.FromEmail}>",
+            to = new[] { message.To },
+            subject = message.Subject,
+            html = message.HtmlBody,
+            text = message.TextBody
+        }), Encoding.UTF8, "application/json");
+
+        try
+        {
+            using var response = await http.SendAsync(request, timeoutCts.Token);
+            logger.LogInformation("Resend email delivery completed with status {StatusCode}.", (int)response.StatusCode);
+            if (!response.IsSuccessStatusCode)
+                return new EmailSendResult(false, ErrorCode: "provider_failed");
+
+            await using var stream = await response.Content.ReadAsStreamAsync(timeoutCts.Token);
+            var json = await JsonNode.ParseAsync(stream, cancellationToken: timeoutCts.Token);
+            var id = json?["id"]?.GetValue<string>();
+            return new EmailSendResult(true, id);
+        }
+        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "Resend email delivery timed out.");
+            return new EmailSendResult(false, ErrorCode: "provider_timeout");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Resend email delivery failed with {FailureType}.", ex.GetType().Name);
+            return new EmailSendResult(false, ErrorCode: "provider_failed");
+        }
+    }
+
+    public Task<EmailSendResult> SendOtpAsync(string email, string code, string? locale, CancellationToken cancellationToken)
+    {
+        var normalizedLocale = EmailTemplateRenderer.NormalizeLocale(locale);
+        var rendered = templates.RenderEmailVerification(new EmailTemplateModel(normalizedLocale, Code: code, ExpiresInMinutes: otpOptions.Value.ExpiryMinutes));
+        return SendAsync(new EmailMessage(email, rendered.Subject, rendered.HtmlBody, rendered.TextBody, normalizedLocale, new Dictionary<string, string> { ["template"] = "email_verification" }), cancellationToken);
     }
 }
 
@@ -2040,7 +2389,7 @@ internal sealed class MockAiPlaceRanker : IAiPlaceRanker
 {
     public Task<IReadOnlyList<RankedPlace>> RankAsync(ParsedIntent intent, IReadOnlyList<PlaceCandidate> candidates, WeatherContext weather, CancellationToken cancellationToken)
     {
-        var list = candidates.Take(3).Select((candidate, index) =>
+        var list = candidates.Take(5).Select((candidate, index) =>
         {
             var family = intent.NormalizedContext.TryGetValue("hasChildren", out var hasChildren) && hasChildren is true;
             var headline = family

@@ -9,6 +9,7 @@ DineCue API is the backend for the DineCue mobile experience. It handles authent
 - Entity Framework Core
 - JWT authentication
 - SignalR
+- Resend transactional email
 - Google Places API New
 - OpenAI API
 
@@ -18,6 +19,7 @@ DineCue API is the backend for the DineCue mobile experience. It handles authent
 - Docker Desktop or a local PostgreSQL instance
 - Google Cloud project with Places API New enabled
 - OpenAI API access
+- Resend account for production email delivery
 
 ## Configuration And Secrets
 
@@ -36,6 +38,13 @@ Required configuration keys:
 - `OpenAI:RequestTimeoutSeconds`
 - `Quotas:RecommendationDailyFree`
 - `Quotas:RecommendationDailyPro`
+- `Email:Provider`
+- `Email:FromEmail`
+- `Email:FromName`
+- `Email:ResendApiKey`
+- `Email:AppBaseUrl`
+- `Email:Enabled`
+- `Email:TimeoutSeconds`
 
 Local user-secrets example:
 
@@ -52,6 +61,13 @@ dotnet user-secrets set "GooglePlaces:RequestTimeoutSeconds" "12" --project Dine
 dotnet user-secrets set "OpenAI:RequestTimeoutSeconds" "30" --project DineCue.Api
 dotnet user-secrets set "Quotas:RecommendationDailyFree" "5" --project DineCue.Api
 dotnet user-secrets set "Quotas:RecommendationDailyPro" "50" --project DineCue.Api
+dotnet user-secrets set "Email:Provider" "resend" --project DineCue.Api
+dotnet user-secrets set "Email:FromEmail" "<verified-sender-email>" --project DineCue.Api
+dotnet user-secrets set "Email:FromName" "DineCue" --project DineCue.Api
+dotnet user-secrets set "Email:ResendApiKey" "<resend-api-key>" --project DineCue.Api
+dotnet user-secrets set "Email:AppBaseUrl" "<app-base-url>" --project DineCue.Api
+dotnet user-secrets set "Email:Enabled" "false" --project DineCue.Api
+dotnet user-secrets set "Email:TimeoutSeconds" "10" --project DineCue.Api
 ```
 
 For local mock recommendation development, set:
@@ -99,9 +115,47 @@ http://localhost:5000/swagger
 - `GET /recommendation-sessions/{id}` is the source of truth for status, errors, and results.
 - SignalR at `/hubs/recommendations` only sends status notifications. It does not send full recommendation data.
 
+## Email Delivery
+
+DineCue uses backend-only transactional email delivery. The first production provider is Resend.
+
+Supported email template scope:
+
+- Welcome email
+- Existing email verification code emails
+- Account notification emails when supported by an existing backend flow
+- Contact or feedback form notification emails
+
+Local development mode:
+
+```bash
+dotnet user-secrets set "Email:Enabled" "false" --project DineCue.Api
+```
+
+When email delivery is disabled, the backend suppresses real delivery and logs only safe delivery metadata. It does not log OTP codes.
+
+Production Resend setup:
+
+```bash
+dotnet user-secrets set "Email:Provider" "resend" --project DineCue.Api
+dotnet user-secrets set "Email:Enabled" "true" --project DineCue.Api
+dotnet user-secrets set "Email:FromEmail" "<verified-sender-email>" --project DineCue.Api
+dotnet user-secrets set "Email:FromName" "DineCue" --project DineCue.Api
+dotnet user-secrets set "Email:ResendApiKey" "<resend-api-key>" --project DineCue.Api
+dotnet user-secrets set "Email:AppBaseUrl" "<app-base-url>" --project DineCue.Api
+```
+
+Resend domain/DNS notes:
+
+- Verify the sending domain in Resend before enabling production email.
+- Add the DNS records Resend provides for SPF, DKIM, and bounce handling.
+- Use a restricted backend-only API key.
+- Keep the sender address on a verified domain.
+
 ## Security Notes
 
 - Provider keys never go to the frontend or mobile app.
+- Email provider keys never go to the frontend or mobile app.
 - OpenAI and Google Places calls happen only on the backend.
 - Store secrets in user-secrets locally and a cloud secret manager in deployed environments.
 - Never commit `.env`, real `appsettings` secrets, user-secrets exports, logs, refresh tokens, access tokens, OTP codes, OTP hashes, or provider credentials.

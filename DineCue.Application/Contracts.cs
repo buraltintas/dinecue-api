@@ -127,7 +127,34 @@ public sealed record DiningIntent(
 public sealed record ReasonedRecommendation(string PlaceId, int Rank, string Label, int MatchScore, string Reason, string[] WhyItFits, string[] WatchOut, string[] BestFor, string Confidence);
 public sealed record RecommendationReasoningResult(string Summary, Dictionary<string, object> InterpretedIntent, IReadOnlyList<ReasonedRecommendation> Recommendations);
 
-public interface IEmailSender { Task SendOtpAsync(string email, string code, CancellationToken cancellationToken); }
+public sealed record EmailMessage(
+    string To,
+    string Subject,
+    string HtmlBody,
+    string TextBody,
+    string Locale,
+    Dictionary<string, string>? Metadata = null);
+public sealed record EmailSendResult(bool Succeeded, string? ProviderMessageId = null, string? ErrorCode = null);
+public sealed record EmailTemplateModel(
+    string Locale,
+    string? DisplayName = null,
+    string? Code = null,
+    string? LinkUrl = null,
+    int? ExpiresInMinutes = null,
+    string? SenderEmail = null,
+    string? Message = null);
+public sealed record RenderedEmailTemplate(string Subject, string HtmlBody, string TextBody);
+public interface IEmailTemplateRenderer
+{
+    RenderedEmailTemplate RenderWelcome(EmailTemplateModel model);
+    RenderedEmailTemplate RenderEmailVerification(EmailTemplateModel model);
+    RenderedEmailTemplate RenderContactFeedbackNotification(EmailTemplateModel model);
+}
+public interface IEmailSender
+{
+    Task<EmailSendResult> SendAsync(EmailMessage message, CancellationToken cancellationToken);
+    Task<EmailSendResult> SendOtpAsync(string email, string code, string? locale, CancellationToken cancellationToken);
+}
 public interface IGoogleAuthValidator { Task<GoogleUserInfo> ValidateAsync(string token, CancellationToken cancellationToken); }
 public interface ITokenService
 {
