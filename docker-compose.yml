@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: dinecue-postgres
+    environment:
+      POSTGRES_DB: dinecue
+      POSTGRES_USER: dinecue
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your local environment or .env file}
+    ports:
+      - "5432:5432"
+    volumes:
+      - dinecue-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dinecue -d dinecue"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  dinecue-postgres-data:
