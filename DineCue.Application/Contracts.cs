@@ -14,7 +14,22 @@ public sealed record GoogleLoginRequest(string Token, string? PreferredLanguage 
 public sealed record RefreshRequest(string RefreshToken);
 public sealed record LogoutRequest(string RefreshToken);
 
-public sealed record ProfileDto(string? DisplayName, string PreferredLanguage, string? Country, string Currency, string DistanceUnit);
+public sealed record ProfileQuotaDto(
+    string Plan,
+    int MonthlyLimit,
+    int UsedThisPeriod,
+    int RemainingThisPeriod,
+    string PeriodKey,
+    DateTimeOffset PeriodEndsAt,
+    bool ProAvailable,
+    string ProStatus);
+public sealed record ProfileDto(
+    string? DisplayName,
+    string PreferredLanguage,
+    string? Country,
+    string Currency,
+    string DistanceUnit,
+    ProfileQuotaDto? Quota = null);
 public sealed record TasteProfileDto(
     string[] FavoriteCuisines,
     string[] DislikedCuisines,

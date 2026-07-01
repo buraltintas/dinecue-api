@@ -141,12 +141,19 @@ public sealed class QuotaServiceTests
     }
 
     [Fact]
-    public void ProfileDto_DoesNotExposePlanOrQuotaFields()
+    public void ProfileDto_ExposesPlanAndRemainingQuotaForFrontend()
     {
-        var names = typeof(ProfileDto).GetProperties().Select(x => x.Name).ToArray();
+        var profile = new ProfileDto(
+            "Ada",
+            "en",
+            "US",
+            "USD",
+            "km",
+            new ProfileQuotaDto("free", 5, 2, 3, "2026-07", DateTimeOffset.UtcNow, true, "coming_soon"));
 
-        Assert.DoesNotContain(names, x => x.Contains("Plan", StringComparison.OrdinalIgnoreCase));
-        Assert.DoesNotContain(names, x => x.Contains("Quota", StringComparison.OrdinalIgnoreCase));
+        Assert.NotNull(profile.Quota);
+        Assert.Equal("free", profile.Quota.Plan);
+        Assert.Equal(3, profile.Quota.RemainingThisPeriod);
     }
 
     [Fact]

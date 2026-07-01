@@ -861,9 +861,9 @@ internal sealed class AuthService(
     }
 }
 
-internal sealed class ProfileService(DineCueDbContext db) : IProfileService
+internal sealed class ProfileService(DineCueDbContext db, IQuotaService quotas) : IProfileService
 {
-    public async Task<ProfileDto> GetProfileAsync(Guid userId, CancellationToken ct) => ToDto(await EnsureProfile(userId, ct));
+    public async Task<ProfileDto> GetProfileAsync(Guid userId, CancellationToken ct) => await ToDtoAsync(userId, await EnsureProfile(userId, ct), ct);
     public async Task<ProfileDto> UpdateProfileAsync(Guid userId, ProfileDto request, CancellationToken ct)
     {
         RequestValidation.Profile(request);
@@ -881,7 +881,7 @@ internal sealed class ProfileService(DineCueDbContext db) : IProfileService
         user.Country = profile.Country;
         user.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(ct);
-        return ToDto(profile);
+        return await ToDtoAsync(userId, profile, ct);
     }
     public async Task<OnboardingStatusResponse> GetOnboardingAsync(Guid userId, CancellationToken ct)
     {
@@ -943,7 +943,20 @@ internal sealed class ProfileService(DineCueDbContext db) : IProfileService
     private async Task<DiningProfile> EnsureDining(Guid id, CancellationToken ct) => await db.DiningProfiles.FindAsync([id], ct) ?? Add(new DiningProfile { UserId = id });
     private async Task<OnboardingState> EnsureOnboarding(Guid id, CancellationToken ct) => await db.OnboardingStates.FindAsync([id], ct) ?? Add(new OnboardingState { UserId = id });
     private T Add<T>(T value) where T : class { db.Add(value); return value; }
-    private static ProfileDto ToDto(UserProfile x) => new(x.DisplayName, x.PreferredLanguage, x.Country, x.Currency, x.DistanceUnit);
+    private async Task<ProfileDto> ToDtoAsync(Guid userId, UserProfile x, CancellationToken ct)
+    {
+        var quota = await quotas.GetAsync(userId, ct);
+        return new(x.DisplayName, x.PreferredLanguage, x.Country, x.Currency, x.DistanceUnit, ToProfileQuota(quota));
+    }
+    private static ProfileQuotaDto ToProfileQuota(QuotaStateResponse quota) => new(
+        quota.Plan,
+        quota.MonthlyLimit,
+        quota.UsedThisPeriod,
+        quota.RemainingThisPeriod,
+        quota.PeriodKey,
+        quota.PeriodEndsAt,
+        quota.ProAvailable,
+        quota.ProStatus);
     private static TasteProfileDto ToDto(TasteProfile x) => new(JsonText.Deserialize(x.FavoriteCuisinesJson, Array.Empty<string>()), JsonText.Deserialize(x.DislikedCuisinesJson, Array.Empty<string>()), JsonText.Deserialize(x.FavoriteDishesJson, Array.Empty<string>()), JsonText.Deserialize(x.DislikedIngredientsJson, Array.Empty<string>()), x.SpiceTolerance, x.SweetSaltyPreference, JsonText.Deserialize(x.DrinkPreferencesJson, Array.Empty<string>()), JsonText.Deserialize(x.DietaryRestrictionsJson, Array.Empty<string>()), JsonText.Deserialize(x.AllergiesJson, Array.Empty<string>()));
     private static DiningProfileDto ToDto(DiningProfile x) => new(x.UsuallyWithKids, x.PrefersQuietPlaces, x.PrefersOutdoor, x.BudgetSensitivity, x.LikesLocalExperiences, x.LikesPremiumPlaces, x.NeedsParking, x.NeedsAccessibility, x.DefaultDistanceMeters);
 }
