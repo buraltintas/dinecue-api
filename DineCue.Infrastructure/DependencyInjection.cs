@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using DineCue.Application;
 using DineCue.Domain;
+using Google.Apis.Auth;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.EntityFrameworkCore;
@@ -39,15 +40,55 @@ public sealed class EmailOtpOptions
     public int EmailWindowMinutes { get; set; } = 15;
 }
 
+public sealed class AbuseProtectionOptions
+{
+    public string[] DisposableEmailDomains { get; set; } = [];
+    public int AccountCreationLimitPerEmailWindow { get; set; } = 3;
+    public int AccountCreationLimitPerProviderWindow { get; set; } = 3;
+    public int AccountCreationWindowMinutes { get; set; } = 60;
+}
+
 public sealed class EmailOptions
 {
     public string Provider { get; set; } = "none";
     public string FromEmail { get; set; } = "";
     public string FromName { get; set; } = "DineCue";
+    public string ReplyToEmail { get; set; } = "";
+    public string BrandLogoUrl { get; set; } = "";
+    public string BrandIconUrl { get; set; } = "";
+    public string PrivacyUrl { get; set; } = "";
+    public string TermsUrl { get; set; } = "";
     public string ResendApiKey { get; set; } = "";
     public string AppBaseUrl { get; set; } = "";
     public bool Enabled { get; set; }
     public int TimeoutSeconds { get; set; } = 10;
+}
+
+public sealed class ProductEmailOptions
+{
+    public bool WelcomeEnabled { get; set; } = true;
+    public bool MonthlyRecapEnabled { get; set; }
+    public bool MonthlyRecapEnabledByDefault { get; set; }
+    public string HistoryUrlPath { get; set; } = "/app/history";
+}
+
+public sealed class GoogleAuthOptions
+{
+    public bool Enabled { get; set; }
+    public string ClientId { get; set; } = "";
+    public string[] AllowedAudiences { get; set; } = [];
+    public int TimeoutSeconds { get; set; } = 10;
+
+    public string[] EffectiveAllowedAudiences()
+    {
+        var values = (AllowedAudiences ?? [])
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim())
+            .ToList();
+        if (values.Count == 0 && !string.IsNullOrWhiteSpace(ClientId))
+            values.Add(ClientId.Trim());
+        return values.Distinct(StringComparer.Ordinal).ToArray();
+    }
 }
 
 public sealed class GooglePlacesOptions
@@ -72,6 +113,8 @@ public sealed class RecommendationOptions
 
 public sealed class QuotasOptions
 {
+    public int MonthlyFree { get; set; } = 5;
+    public int MonthlyPro { get; set; } = 50;
     public int RecommendationDailyFree { get; set; } = 5;
     public int RecommendationDailyPro { get; set; } = 50;
 }
@@ -87,7 +130,10 @@ public static class DependencyInjection
         services.AddMemoryCache();
         services.Configure<JwtOptions>(configuration.GetSection("Jwt"));
         services.Configure<EmailOtpOptions>(configuration.GetSection("EmailOtp"));
+        services.Configure<AbuseProtectionOptions>(configuration.GetSection("AbuseProtection"));
         services.Configure<EmailOptions>(configuration.GetSection("Email"));
+        services.Configure<ProductEmailOptions>(configuration.GetSection("ProductEmail"));
+        services.Configure<GoogleAuthOptions>(configuration.GetSection("GoogleAuth"));
         services.Configure<GooglePlacesOptions>(configuration.GetSection("GooglePlaces"));
         services.Configure<OpenAIOptions>(configuration.GetSection("OpenAI"));
         services.Configure<RecommendationOptions>(configuration.GetSection("Recommendation"));
@@ -142,11 +188,14 @@ public static class DependencyInjection
         services.AddScoped<IAuthService, AuthService>();
         services.AddScoped<IProfileService, ProfileService>();
         services.AddScoped<IRecommendationService, RecommendationService>();
+        services.AddScoped<IEmailNotificationService, EmailNotificationService>();
+        services.AddScoped<IMonthlyRecapEmailService, MonthlyRecapEmailService>();
         services.AddScoped<RecommendationProcessor>();
         services.AddScoped<IRestaurantService, RestaurantService>();
         services.AddScoped<IMenuScanService, MenuScanService>();
         services.AddScoped<IInteractionEventService, InteractionEventService>();
         services.AddScoped<IQuotaService, QuotaService>();
+        services.AddScoped<IRecommendationStatusNotifier, NoopRecommendationStatusNotifier>();
         services.AddSingleton<IRecommendationJobQueue, InMemoryRecommendationJobQueue>();
         services.AddHostedService<RecommendationProcessingWorker>();
         if (useMockRecommendationProvider)
@@ -171,6 +220,7 @@ public static class DependencyInjection
         }
         services.AddScoped<ISubscriptionProvider, MockSubscriptionProvider>();
         services.AddScoped<OtpRateLimiter>();
+        services.AddScoped<AbuseProtectionService>();
         services.AddSingleton<IEmailTemplateRenderer, EmailTemplateRenderer>();
         var emailOptions = configuration.GetSection("Email").Get<EmailOptions>() ?? new EmailOptions();
         if (emailOptions.Enabled && emailOptions.Provider.Equals("resend", StringComparison.OrdinalIgnoreCase))
@@ -190,7 +240,18 @@ public static class DependencyInjection
         {
             services.AddSingleton<IEmailSender, DevelopmentEmailSender>();
         }
-        services.AddSingleton<IGoogleAuthValidator>(_ => new MockGoogleAuthValidator(environment));
+        var googleAuthOptions = configuration.GetSection("GoogleAuth").Get<GoogleAuthOptions>() ?? new GoogleAuthOptions();
+        if (googleAuthOptions.Enabled)
+        {
+            ValidateGoogleAuthOptions(googleAuthOptions);
+            services.AddTransient<IGoogleAuthValidator, GoogleAuthValidator>();
+        }
+        else
+        {
+            if (!environment.IsDevelopment())
+                throw new InvalidOperationException("GoogleAuth:Enabled must be true outside Development.");
+            services.AddSingleton<IGoogleAuthValidator>(_ => new MockGoogleAuthValidator(environment));
+        }
         services.AddSingleton<ITokenService, TokenService>();
         services.AddSingleton<IPlacesProvider, MockPlacesProvider>();
         services.AddSingleton<ILocationResolver, MockLocationResolver>();
@@ -203,6 +264,14 @@ public static class DependencyInjection
         services.AddSingleton<IAiMenuInterpreter, MockAiMenuInterpreter>();
         services.AddSingleton<IReservationLinkResolver, MockReservationLinkResolver>();
         return services;
+    }
+
+    private static void ValidateGoogleAuthOptions(GoogleAuthOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.ClientId))
+            throw new InvalidOperationException("GoogleAuth:ClientId must be configured when GoogleAuth:Enabled is true.");
+        if (options.EffectiveAllowedAudiences().Length == 0)
+            throw new InvalidOperationException("GoogleAuth:AllowedAudiences must include at least one audience when GoogleAuth:Enabled is true.");
     }
 }
 
@@ -466,19 +535,63 @@ internal static partial class RequestValidation
     private static partial Regex CurrencyRegex();
 }
 
-internal sealed class OtpRateLimiter(IMemoryCache cache, Microsoft.Extensions.Options.IOptions<EmailOtpOptions> options)
+internal sealed class AbuseProtectionService(
+    IMemoryCache cache,
+    Microsoft.Extensions.Options.IOptions<AbuseProtectionOptions> options,
+    Microsoft.Extensions.Options.IOptions<JwtOptions> jwtOptions)
 {
-    public void CheckStart(string email) => Check($"otp-start:{email}", options.Value.StartLimitPerEmailWindow);
-    public void CheckVerify(string email) => Check($"otp-verify:{email}", options.Value.VerifyLimitPerEmailWindow);
+    public void EnsureEmailAllowed(string email)
+    {
+        var domain = email.Split('@').LastOrDefault()?.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(domain)) return;
+        var blocked = options.Value.DisposableEmailDomains.Any(x => domain.Equals(x.Trim().ToLowerInvariant(), StringComparison.Ordinal));
+        if (blocked)
+            throw new ApiException("temporarily_limited", "We could not send a sign-in code right now.", 429);
+    }
+
+    public void CheckAccountCreation(string provider, string providerUserId, string email)
+    {
+        var window = TimeSpan.FromMinutes(Math.Clamp(options.Value.AccountCreationWindowMinutes, 5, 24 * 60));
+        Check(
+            $"account-create:email:{StableHash("email:" + email)}",
+            Math.Max(1, options.Value.AccountCreationLimitPerEmailWindow),
+            window);
+        Check(
+            $"account-create:provider:{StableHash(provider.Trim().ToLowerInvariant() + ":" + providerUserId.Trim())}",
+            Math.Max(1, options.Value.AccountCreationLimitPerProviderWindow),
+            window);
+    }
+
+    public string StableHash(string value) => IdentityKeyHasher.Hash(value, jwtOptions.Value.SigningKey);
+
+    private void Check(string key, int limit, TimeSpan window)
+    {
+        var count = cache.Get<int?>(key) ?? 0;
+        if (count >= limit)
+            throw new ApiException("too_many_attempts", "Too many attempts. Please try again later.", 429);
+        cache.Set(key, count + 1, window);
+    }
+}
+
+internal sealed class OtpRateLimiter(IMemoryCache cache, Microsoft.Extensions.Options.IOptions<EmailOtpOptions> options, AbuseProtectionService abuseProtection)
+{
+    public void CheckStart(string email) => Check($"otp-start:{abuseProtection.StableHash("email:" + email)}", options.Value.StartLimitPerEmailWindow);
+    public void CheckVerify(string email) => Check($"otp-verify:{abuseProtection.StableHash("email:" + email)}", options.Value.VerifyLimitPerEmailWindow);
 
     private void Check(string key, int limit)
     {
         var window = TimeSpan.FromMinutes(Math.Clamp(options.Value.EmailWindowMinutes, 1, 60));
         var count = cache.Get<int?>(key) ?? 0;
         if (count >= limit)
-            throw new ApiException("rate_limited", "Too many attempts. Please try again later.", 429);
+            throw new ApiException("too_many_attempts", "Too many attempts. Please try again later.", 429);
         cache.Set(key, count + 1, window);
     }
+}
+
+internal static class IdentityKeyHasher
+{
+    public static string Hash(string value, string signingKey) =>
+        Convert.ToHexString(HMACSHA256.HashData(Encoding.UTF8.GetBytes(signingKey), Encoding.UTF8.GetBytes(value.Trim().ToLowerInvariant()))).ToLowerInvariant();
 }
 
 internal sealed class TokenService(Microsoft.Extensions.Options.IOptions<JwtOptions> options) : ITokenService
@@ -511,20 +624,25 @@ internal sealed class AuthService(
     IGoogleAuthValidator google,
     IEmailSender emailSender,
     OtpRateLimiter otpRateLimiter,
+    AbuseProtectionService abuseProtection,
+    IEmailNotificationService emailNotifications,
     IHostEnvironment environment,
     Microsoft.Extensions.Options.IOptions<EmailOtpOptions> otpOptions,
-    Microsoft.Extensions.Options.IOptions<JwtOptions> jwtOptions) : IAuthService
+    Microsoft.Extensions.Options.IOptions<JwtOptions> jwtOptions,
+    ILogger<AuthService> logger) : IAuthService
 {
     public async Task<EmailStartResponse> StartEmailAsync(EmailStartRequest request, CancellationToken ct)
     {
         if (request == null) throw new ApiException("validation_error", "Request body is required.", 400, new { field = "body" });
         var email = NormalizeEmail(request.Email);
         var preferredLanguage = RequestValidation.PreferredLanguageOrDefault(request.PreferredLanguage);
+        abuseProtection.EnsureEmailAllowed(email);
         otpRateLimiter.CheckStart(email);
         var code = RandomNumberGenerator.GetInt32(100000, 999999).ToString();
         var now = DateTimeOffset.UtcNow;
-        await db.EmailOtps.Where(x => x.Email == email && x.ConsumedAt == null && x.ExpiresAt > now)
-            .ExecuteUpdateAsync(x => x.SetProperty(o => o.ConsumedAt, now), ct);
+        var activeOtps = await db.EmailOtps.Where(x => x.Email == email && x.ConsumedAt == null && x.ExpiresAt > now).ToListAsync(ct);
+        foreach (var activeOtp in activeOtps)
+            activeOtp.ConsumedAt = now;
         db.EmailOtps.Add(new EmailOtp
         {
             Email = email,
@@ -533,7 +651,17 @@ internal sealed class AuthService(
             CreatedAt = now
         });
         await db.SaveChangesAsync(ct);
-        _ = await emailSender.SendOtpAsync(email, code, preferredLanguage, ct);
+        var sendResult = await emailSender.SendOtpAsync(email, code, preferredLanguage, ct);
+        if (!sendResult.Succeeded)
+        {
+            var unsentOtp = await db.EmailOtps.FirstOrDefaultAsync(x => x.Email == email && x.CodeHash == tokens.HashOtp(email, code) && x.ConsumedAt == null, ct);
+            if (unsentOtp != null)
+            {
+                unsentOtp.ConsumedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(ct);
+            }
+            throw new ApiException("email_send_failed", "We could not send a sign-in code right now.", 503);
+        }
         return new EmailStartResponse("If the email can receive a code, an OTP has been sent.", environment.IsDevelopment() && otpOptions.Value.ExposeDevOtp ? code : null);
     }
 
@@ -547,7 +675,7 @@ internal sealed class AuthService(
         var otp = await db.EmailOtps.OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync(x => x.Email == email && x.ConsumedAt == null, ct)
             ?? throw new ApiException("invalid_otp", "The OTP is invalid or expired.", 400);
         if (otp.ExpiresAt <= DateTimeOffset.UtcNow) throw new ApiException("invalid_otp", "The OTP is invalid or expired.", 400);
-        if (otp.AttemptCount >= otpOptions.Value.MaxAttempts) throw new ApiException("otp_locked", "Too many OTP attempts.", 429);
+        if (otp.AttemptCount >= otpOptions.Value.MaxAttempts) throw new ApiException("too_many_attempts", "Too many attempts. Please try again later.", 429);
         if (otp.CodeHash != tokens.HashOtp(email, request.Code))
         {
             otp.AttemptCount++;
@@ -563,7 +691,19 @@ internal sealed class AuthService(
         if (string.IsNullOrWhiteSpace(request.Token) || request.Token.Length > 4096)
             throw new ApiException("validation_error", "A valid Google token is required.", 400, new { field = "token" });
         var preferredLanguage = RequestValidation.PreferredLanguageOrDefault(request.PreferredLanguage);
-        var info = await google.ValidateAsync(request.Token, ct);
+        GoogleUserInfo info;
+        try
+        {
+            info = await google.ValidateAsync(request.Token, ct);
+        }
+        catch (ApiException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            throw new ApiException("invalid_google_credential", "Google sign-in could not be completed.", 401);
+        }
         return await SignInAsync("google", info.ProviderUserId, NormalizeEmail(info.Email), info.DisplayName, info.AvatarUrl, preferredLanguage, null, ct);
     }
 
@@ -605,8 +745,11 @@ internal sealed class AuthService(
         if (string.IsNullOrWhiteSpace(request.RefreshToken) || request.RefreshToken.Length > 500)
             return;
         var hash = tokens.HashToken(request.RefreshToken);
-        await db.RefreshTokens.Where(x => x.UserId == userId && x.TokenHash == hash && x.RevokedAt == null)
-            .ExecuteUpdateAsync(x => x.SetProperty(t => t.RevokedAt, DateTimeOffset.UtcNow), ct);
+        var tokensToRevoke = await db.RefreshTokens.Where(x => x.UserId == userId && x.TokenHash == hash && x.RevokedAt == null).ToListAsync(ct);
+        foreach (var token in tokensToRevoke)
+            token.RevokedAt = DateTimeOffset.UtcNow;
+        if (tokensToRevoke.Count > 0)
+            await db.SaveChangesAsync(ct);
     }
 
     public async Task<UserDto> GetMeAsync(Guid userId, CancellationToken ct) =>
@@ -616,7 +759,10 @@ internal sealed class AuthService(
     {
         var user = await db.Users.FirstOrDefaultAsync(x => x.Id == userId, ct) ?? throw new ApiException("not_found", "User was not found.", 404);
         user.DeletedAt = DateTimeOffset.UtcNow;
-        await db.RefreshTokens.Where(x => x.UserId == userId && x.RevokedAt == null).ExecuteUpdateAsync(x => x.SetProperty(t => t.RevokedAt, DateTimeOffset.UtcNow), ct);
+        var tokensToRevoke = await db.RefreshTokens.Where(x => x.UserId == userId && x.RevokedAt == null).ToListAsync(ct);
+        foreach (var token in tokensToRevoke)
+            token.RevokedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
         await db.SaveChangesAsync(ct);
     }
 
@@ -631,11 +777,16 @@ internal sealed class AuthService(
 
             var identity = await db.UserIdentities.FirstOrDefaultAsync(x => x.Provider == provider && x.ProviderUserId == providerUserId, ct);
             User? user = null;
-            if (identity != null) user = await db.Users.FirstOrDefaultAsync(x => x.Id == identity.UserId, ct);
+            if (identity != null)
+            {
+                identity.LastUsedAt = DateTimeOffset.UtcNow;
+                user = await db.Users.FirstOrDefaultAsync(x => x.Id == identity.UserId, ct);
+            }
             user ??= await db.Users.FirstOrDefaultAsync(x => x.Email == email, ct);
 
             if (user == null)
             {
+                abuseProtection.CheckAccountCreation(provider, providerUserId, email);
                 isNew = true;
                 user = new User { Email = email, DisplayName = displayName, AvatarUrl = avatarUrl, PreferredLanguage = preferredLanguage };
                 db.Users.Add(user);
@@ -650,7 +801,7 @@ internal sealed class AuthService(
             user.UpdatedAt = DateTimeOffset.UtcNow;
 
             if (identity == null)
-                db.UserIdentities.Add(new UserIdentity { UserId = user.Id, Provider = provider, ProviderUserId = providerUserId, Email = email });
+                db.UserIdentities.Add(new UserIdentity { UserId = user.Id, Provider = provider, ProviderUserId = providerUserId, Email = email, LastUsedAt = DateTimeOffset.UtcNow });
 
             await EnsureUserDefaultsAsync(user, displayName, isNew ? preferredLanguage : user.PreferredLanguage, ct);
 
@@ -662,7 +813,20 @@ internal sealed class AuthService(
             await db.SaveChangesAsync(ct);
             await transaction.CommitAsync(ct);
 
-            return new LoginResponse(tokens.CreateAccessToken(user.Id, user.Email, user.PreferredLanguage), refresh, user.ToDto(), isNew, user.OnboardingCompletedAt != null);
+            var userDto = user.ToDto();
+            if (isNew)
+            {
+                try
+                {
+                    await emailNotifications.SendWelcomeAsync(userDto, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    logger.LogWarning(ex, "Welcome email could not be sent for user {UserId}.", user.Id);
+                }
+            }
+
+            return new LoginResponse(tokens.CreateAccessToken(user.Id, user.Email, user.PreferredLanguage), refresh, userDto, isNew, user.OnboardingCompletedAt != null);
         }
         catch
         {
@@ -690,9 +854,10 @@ internal sealed class AuthService(
 
     private async Task RevokeRefreshTokenChainAsync(Guid userId, CancellationToken ct)
     {
-        await db.RefreshTokens
-            .Where(x => x.UserId == userId && x.RevokedAt == null)
-            .ExecuteUpdateAsync(x => x.SetProperty(t => t.RevokedAt, DateTimeOffset.UtcNow), ct);
+        var tokensToRevoke = await db.RefreshTokens.Where(x => x.UserId == userId && x.RevokedAt == null).ToListAsync(ct);
+        foreach (var token in tokensToRevoke)
+            token.RevokedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
     }
 }
 
@@ -783,26 +948,198 @@ internal sealed class ProfileService(DineCueDbContext db) : IProfileService
     private static DiningProfileDto ToDto(DiningProfile x) => new(x.UsuallyWithKids, x.PrefersQuietPlaces, x.PrefersOutdoor, x.BudgetSensitivity, x.LikesLocalExperiences, x.LikesPremiumPlaces, x.NeedsParking, x.NeedsAccessibility, x.DefaultDistanceMeters);
 }
 
-internal sealed class QuotaService(DineCueDbContext db, ISubscriptionProvider subscriptions, Microsoft.Extensions.Options.IOptions<QuotasOptions> options) : IQuotaService
+internal sealed class QuotaService(
+    DineCueDbContext db,
+    ISubscriptionProvider subscriptions,
+    Microsoft.Extensions.Options.IOptions<QuotasOptions> options,
+    Microsoft.Extensions.Options.IOptions<JwtOptions> jwtOptions) : IQuotaService
 {
-    public async Task CheckAndConsumeRecommendationAsync(Guid userId, CancellationToken ct)
+    private const string FreePlan = "free";
+    private const string ProPlan = "pro";
+
+    public async Task<QuotaStateResponse> GetAsync(Guid userId, CancellationToken ct)
     {
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-        var pro = await subscriptions.HasActiveProAsync(userId, ct);
-        var quotaOptions = options.Value;
-        var limit = Math.Max(1, pro ? quotaOptions.RecommendationDailyPro : quotaOptions.RecommendationDailyFree);
-        var usage = await db.DailyUsages.FirstOrDefaultAsync(x => x.UserId == userId && x.UsageDate == today, ct);
+        var (usage, ledgers, plan, limit, periodStart) = await GetMonthlyUsageAsync(userId, create: false, ct);
+        return ToState(plan, limit, usage, ledgers, periodStart);
+    }
+
+    public Task<QuotaStateResponse> ReserveRecommendationAsync(Guid userId, CancellationToken ct) =>
+        ReserveAsync(userId, usage => usage.RecommendationSessionCount++, ledger => ledger.RecommendationSessionCount++, ct);
+
+    public Task<QuotaStateResponse> ReserveMenuScanAsync(Guid userId, CancellationToken ct) =>
+        ReserveAsync(userId, usage => usage.MenuScanCount++, ledger => ledger.MenuScanCount++, ct);
+
+    public Task<QuotaStateResponse> ReserveRestaurantFitCheckAsync(Guid userId, CancellationToken ct) =>
+        ReserveAsync(userId, usage => usage.FitCheckCount++, ledger => ledger.FitCheckCount++, ct);
+
+    public Task ReleaseRecommendationAsync(Guid userId, CancellationToken ct) =>
+        ReleaseAsync(userId, usage => usage.RecommendationSessionCount = Math.Max(0, usage.RecommendationSessionCount - 1), ledger => ledger.RecommendationSessionCount = Math.Max(0, ledger.RecommendationSessionCount - 1), ct);
+
+    public Task ReleaseMenuScanAsync(Guid userId, CancellationToken ct) =>
+        ReleaseAsync(userId, usage => usage.MenuScanCount = Math.Max(0, usage.MenuScanCount - 1), ledger => ledger.MenuScanCount = Math.Max(0, ledger.MenuScanCount - 1), ct);
+
+    public Task ReleaseRestaurantFitCheckAsync(Guid userId, CancellationToken ct) =>
+        ReleaseAsync(userId, usage => usage.FitCheckCount = Math.Max(0, usage.FitCheckCount - 1), ledger => ledger.FitCheckCount = Math.Max(0, ledger.FitCheckCount - 1), ct);
+
+    private async Task<QuotaStateResponse> ReserveAsync(Guid userId, Action<DailyUsage> incrementUser, Action<IdentityUsageLedger> incrementLedger, CancellationToken ct)
+    {
+        var (usage, ledgers, plan, limit, periodStart) = await GetMonthlyUsageAsync(userId, create: true, ct);
         if (usage == null)
-        {
-            usage = new DailyUsage { UserId = userId, UsageDate = today };
-            db.DailyUsages.Add(usage);
-        }
-        if (usage.RecommendationSessionCount >= limit)
-            throw new ApiException("quota_exceeded", "You have reached your daily recommendation limit.", 429, new { limit, plan = pro ? "pro" : "free" });
-        usage.RecommendationSessionCount++;
+            throw new ApiException("quota_unavailable", "Quota could not be checked right now.", 503);
+        var used = Used(usage, ledgers);
+        if (used >= limit)
+            throw QuotaExceeded(plan, limit, usage, ledgers, periodStart);
+
+        incrementUser(usage);
         usage.UpdatedAt = DateTimeOffset.UtcNow;
+        foreach (var ledger in ledgers)
+        {
+            incrementLedger(ledger);
+            ledger.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+        await db.SaveChangesAsync(ct);
+        return ToState(plan, limit, usage, ledgers, periodStart);
+    }
+
+    private async Task ReleaseAsync(Guid userId, Action<DailyUsage> decrementUser, Action<IdentityUsageLedger> decrementLedger, CancellationToken ct)
+    {
+        var periodStart = CurrentPeriodStart();
+        var usage = await db.DailyUsages.FirstOrDefaultAsync(x => x.UserId == userId && x.UsageDate == periodStart, ct);
+        var ledgers = await GetIdentityLedgersAsync(userId, periodStart, create: false, ct);
+        if (usage == null && ledgers.Count == 0) return;
+
+        if (usage != null && Used(usage) > 0)
+        {
+            decrementUser(usage);
+            usage.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+        foreach (var ledger in ledgers.Where(x => Used(x) > 0))
+        {
+            decrementLedger(ledger);
+            ledger.UpdatedAt = DateTimeOffset.UtcNow;
+        }
         await db.SaveChangesAsync(ct);
     }
+
+    private async Task<(DailyUsage? Usage, List<IdentityUsageLedger> Ledgers, string Plan, int Limit, DateOnly PeriodStart)> GetMonthlyUsageAsync(Guid userId, bool create, CancellationToken ct)
+    {
+        var periodStart = CurrentPeriodStart();
+        var pro = await subscriptions.HasActiveProAsync(userId, ct);
+        var plan = pro ? ProPlan : FreePlan;
+        var limit = LimitFor(plan);
+        var usage = await db.DailyUsages.FirstOrDefaultAsync(x => x.UserId == userId && x.UsageDate == periodStart, ct);
+        if (usage == null && create)
+        {
+            usage = new DailyUsage { UserId = userId, UsageDate = periodStart };
+            db.DailyUsages.Add(usage);
+        }
+        var ledgers = await GetIdentityLedgersAsync(userId, periodStart, create, ct);
+        return (usage, ledgers, plan, limit, periodStart);
+    }
+
+    private async Task<List<IdentityUsageLedger>> GetIdentityLedgersAsync(Guid userId, DateOnly periodStart, bool create, CancellationToken ct)
+    {
+        var keys = await GetIdentityKeysAsync(userId, ct);
+        var ledgers = new List<IdentityUsageLedger>();
+        foreach (var key in keys)
+        {
+            var ledger = await db.IdentityUsageLedgers.FirstOrDefaultAsync(x => x.KeyType == key.KeyType && x.KeyHash == key.KeyHash && x.PeriodStart == periodStart, ct);
+            if (ledger == null && create)
+            {
+                ledger = new IdentityUsageLedger { KeyType = key.KeyType, KeyHash = key.KeyHash, PeriodStart = periodStart };
+                db.IdentityUsageLedgers.Add(ledger);
+            }
+            if (ledger != null) ledgers.Add(ledger);
+        }
+        return ledgers;
+    }
+
+    private async Task<IReadOnlyList<(string KeyType, string KeyHash)>> GetIdentityKeysAsync(Guid userId, CancellationToken ct)
+    {
+        var keys = new List<(string KeyType, string KeyHash)>();
+        AddKey(keys, "user", userId.ToString("N"));
+        var user = await db.Users.AsNoTracking().FirstOrDefaultAsync(x => x.Id == userId, ct);
+        if (user != null)
+            AddKey(keys, "email", "email:" + user.Email);
+        var identities = await db.UserIdentities.AsNoTracking().Where(x => x.UserId == userId).ToListAsync(ct);
+        foreach (var identity in identities)
+        {
+            if (!string.IsNullOrWhiteSpace(identity.Email))
+                AddKey(keys, "email", "email:" + identity.Email);
+            if (!string.IsNullOrWhiteSpace(identity.Provider) && !string.IsNullOrWhiteSpace(identity.ProviderUserId))
+                AddKey(keys, "provider", $"{identity.Provider}:{identity.ProviderUserId}");
+        }
+
+        return keys
+            .DistinctBy(x => x.KeyType + ":" + x.KeyHash)
+            .ToArray();
+    }
+
+    private void AddKey(List<(string KeyType, string KeyHash)> keys, string keyType, string rawValue)
+    {
+        if (string.IsNullOrWhiteSpace(rawValue)) return;
+        keys.Add((keyType, IdentityKeyHasher.Hash(rawValue, jwtOptions.Value.SigningKey)));
+    }
+
+    private int LimitFor(string plan)
+    {
+        var quotaOptions = options.Value;
+        var configured = plan == ProPlan ? quotaOptions.MonthlyPro : quotaOptions.MonthlyFree;
+        var legacy = plan == ProPlan ? quotaOptions.RecommendationDailyPro : quotaOptions.RecommendationDailyFree;
+        return Math.Max(1, configured > 0 ? configured : legacy);
+    }
+
+    private static ApiException QuotaExceeded(string plan, int limit, DailyUsage? usage, IReadOnlyList<IdentityUsageLedger> ledgers, DateOnly periodStart)
+    {
+        var state = ToState(plan, limit, usage, ledgers, periodStart);
+        return new ApiException("quota_exceeded", "You have reached your monthly plan limit.", 429, new
+        {
+            limit,
+            plan = state.Plan,
+            monthlyLimit = state.MonthlyLimit,
+            usedThisPeriod = state.UsedThisPeriod,
+            remainingThisPeriod = state.RemainingThisPeriod,
+            periodKey = state.PeriodKey,
+            periodEndsAt = state.PeriodEndsAt
+        });
+    }
+
+    private static QuotaStateResponse ToState(string plan, int limit, DailyUsage? usage, IReadOnlyList<IdentityUsageLedger> ledgers, DateOnly periodStart)
+    {
+        var used = Used(usage, ledgers);
+        return new QuotaStateResponse(
+            plan,
+            limit,
+            used,
+            Math.Max(0, limit - used),
+            $"{periodStart.Year:D4}-{periodStart.Month:D2}",
+            PeriodEndsAt(periodStart),
+            true,
+            "coming_soon");
+    }
+
+    private static int Used(DailyUsage? usage, IReadOnlyList<IdentityUsageLedger> ledgers)
+    {
+        var used = Used(usage);
+        foreach (var ledger in ledgers)
+            used = Math.Max(used, Used(ledger));
+        return used;
+    }
+
+    private static int Used(DailyUsage? usage) =>
+        usage == null ? 0 : usage.RecommendationSessionCount + usage.MenuScanCount + usage.FitCheckCount;
+
+    private static int Used(IdentityUsageLedger ledger) =>
+        ledger.RecommendationSessionCount + ledger.MenuScanCount + ledger.FitCheckCount;
+
+    private static DateOnly CurrentPeriodStart()
+    {
+        var now = DateTimeOffset.UtcNow;
+        return new DateOnly(now.Year, now.Month, 1);
+    }
+
+    private static DateTimeOffset PeriodEndsAt(DateOnly periodStart) =>
+        new DateTimeOffset(periodStart.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc), TimeSpan.Zero).AddMonths(1).AddTicks(-1);
 }
 
 internal sealed class RecommendationService(
@@ -815,28 +1152,36 @@ internal sealed class RecommendationService(
     {
         RequestValidation.Recommendation(request);
         var language = SupportedLanguages.NormalizeOrDefault(request.Language);
-        await quota.CheckAndConsumeRecommendationAsync(userId, ct);
+        await quota.ReserveRecommendationAsync(userId, ct);
         var cues = request.SelectedCues ?? [];
         var location = request.Location ?? new LocationInput("current", null, null, null, null);
 
-        var session = new RecommendationSession
+        try
         {
-            UserId = userId,
-            RawText = request.RawText,
-            Language = language,
-            LocationMode = string.IsNullOrWhiteSpace(location.Mode) ? "current" : location.Mode.Trim().ToLowerInvariant(),
-            LocationText = location.Text,
-            Latitude = location.Lat,
-            Longitude = location.Lng,
-            PlaceId = location.PlaceId,
-            SelectedCuesJson = JsonText.Serialize(cues),
-            InputContextJson = JsonText.Serialize(request.Context ?? new Dictionary<string, object>()),
-            Status = "queued"
-        };
-        db.RecommendationSessions.Add(session);
-        await db.SaveChangesAsync(ct);
-        await jobQueue.EnqueueAsync(new RecommendationJob(session.Id, userId), ct);
-        return new RecommendationSessionAcceptedResponse(session.Id, session.Status, $"/recommendation-sessions/{session.Id}");
+            var session = new RecommendationSession
+            {
+                UserId = userId,
+                RawText = request.RawText,
+                Language = language,
+                LocationMode = string.IsNullOrWhiteSpace(location.Mode) ? "current" : location.Mode.Trim().ToLowerInvariant(),
+                LocationText = location.Text,
+                Latitude = location.Lat,
+                Longitude = location.Lng,
+                PlaceId = location.PlaceId,
+                SelectedCuesJson = JsonText.Serialize(cues),
+                InputContextJson = JsonText.Serialize(request.Context ?? new Dictionary<string, object>()),
+                Status = "queued"
+            };
+            db.RecommendationSessions.Add(session);
+            await db.SaveChangesAsync(ct);
+            await jobQueue.EnqueueAsync(new RecommendationJob(session.Id, userId), ct);
+            return new RecommendationSessionAcceptedResponse(session.Id, session.Status, $"/recommendation-sessions/{session.Id}");
+        }
+        catch
+        {
+            await quota.ReleaseRecommendationAsync(userId, ct);
+            throw;
+        }
     }
 
     public async Task<IReadOnlyList<HistoryItemDto>> ListHistoryAsync(Guid userId, CancellationToken ct)
@@ -974,6 +1319,7 @@ internal sealed class RecommendationProcessor(
     IRouteProvider routes,
     IInteractionEventService events,
     IRecommendationStatusNotifier notifier,
+    IQuotaService quota,
     ILogger<RecommendationProcessor> logger,
     Microsoft.Extensions.Options.IOptions<RecommendationOptions> recommendationOptions)
 {
@@ -1199,6 +1545,7 @@ internal sealed class RecommendationProcessor(
         session.FailedAt = DateTimeOffset.UtcNow;
         session.ErrorCode = errorCode;
         session.ErrorMessage = errorMessage;
+        await quota.ReleaseRecommendationAsync(session.UserId, ct);
         await db.SaveChangesAsync(ct);
         await notifier.FailedAsync(session.UserId, new RecommendationFailedEvent(session.Id, session.Status, session.ErrorCode, session.ErrorMessage), ct);
     }
@@ -1214,6 +1561,13 @@ internal sealed class InMemoryRecommendationJobQueue : IRecommendationJobQueue
 
     public ValueTask<RecommendationJob> DequeueAsync(CancellationToken cancellationToken) =>
         _channel.Reader.ReadAsync(cancellationToken);
+}
+
+internal sealed class NoopRecommendationStatusNotifier : IRecommendationStatusNotifier
+{
+    public Task StatusChangedAsync(Guid userId, RecommendationStatusChanged status, CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task CompletedAsync(Guid userId, RecommendationStatusChanged status, CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task FailedAsync(Guid userId, RecommendationFailedEvent failure, CancellationToken cancellationToken) => Task.CompletedTask;
 }
 
 internal sealed class RecommendationProcessingWorker(
@@ -1262,6 +1616,7 @@ internal sealed class RecommendationProcessingWorker(
             using var scope = scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<DineCueDbContext>();
             var notifier = scope.ServiceProvider.GetRequiredService<IRecommendationStatusNotifier>();
+            var quota = scope.ServiceProvider.GetRequiredService<IQuotaService>();
             var session = await db.RecommendationSessions.FirstOrDefaultAsync(x => x.Id == job.SessionId && x.UserId == job.UserId, stoppingToken);
             if (session == null || session.Status is "completed" or "failed" or "cancelled") return;
 
@@ -1271,6 +1626,7 @@ internal sealed class RecommendationProcessingWorker(
             session.FailedAt = DateTimeOffset.UtcNow;
             session.ErrorCode = failure?.Code ?? "recommendation_failed";
             session.ErrorMessage = failure?.ClientMessage ?? "We could not complete this recommendation right now.";
+            await quota.ReleaseRecommendationAsync(session.UserId, stoppingToken);
             await db.SaveChangesAsync(stoppingToken);
             await notifier.FailedAsync(session.UserId, new RecommendationFailedEvent(session.Id, session.Status, session.ErrorCode, session.ErrorMessage), stoppingToken);
         }
@@ -2010,7 +2366,7 @@ internal sealed class MockRecommendationReasoner(IAiPlaceRanker ranker) : IRecom
     }
 }
 
-internal sealed class RestaurantService(IPlacesProvider places, ILocationResolver locations, IReservationLinkResolver reservations, IAiRestaurantFitAnalyzer fit, IInteractionEventService events) : IRestaurantService
+internal sealed class RestaurantService(IPlacesProvider places, ILocationResolver locations, IReservationLinkResolver reservations, IAiRestaurantFitAnalyzer fit, IInteractionEventService events, IQuotaService quota) : IRestaurantService
 {
     public async Task<IReadOnlyList<RestaurantSearchResultDto>> SearchAsync(RestaurantSearchRequest request, CancellationToken ct)
     {
@@ -2036,29 +2392,47 @@ internal sealed class RestaurantService(IPlacesProvider places, ILocationResolve
         RequestValidation.RestaurantFit(request);
         var language = SupportedLanguages.NormalizeOrDefault(request.Language);
         request = request with { Language = language };
-        var place = await places.GetByPlaceIdAsync(placeId, ct) ?? throw new ApiException("not_found", "Restaurant was not found.", 404);
-        var reservation = await reservations.ResolveAsync(place, ct);
-        var response = await fit.AnalyzeAsync(place, request, reservation, ct);
-        await events.TrackAsync(userId, new InteractionEventRequest("RestaurantFitChecked", "Restaurant", placeId, new Dictionary<string, object> { ["fitScore"] = response.FitScore }), ct);
-        return response;
+        await quota.ReserveRestaurantFitCheckAsync(userId, ct);
+        try
+        {
+            var place = await places.GetByPlaceIdAsync(placeId, ct) ?? throw new ApiException("not_found", "Restaurant was not found.", 404);
+            var reservation = await reservations.ResolveAsync(place, ct);
+            var response = await fit.AnalyzeAsync(place, request, reservation, ct);
+            await events.TrackAsync(userId, new InteractionEventRequest("RestaurantFitChecked", "Restaurant", placeId, new Dictionary<string, object> { ["fitScore"] = response.FitScore }), ct);
+            return response;
+        }
+        catch
+        {
+            await quota.ReleaseRestaurantFitCheckAsync(userId, ct);
+            throw;
+        }
     }
 }
 
-internal sealed class MenuScanService(DineCueDbContext db, IMenuOcrProvider ocr, IAiMenuInterpreter ai, IInteractionEventService events) : IMenuScanService
+internal sealed class MenuScanService(DineCueDbContext db, IMenuOcrProvider ocr, IAiMenuInterpreter ai, IInteractionEventService events, IQuotaService quota) : IMenuScanService
 {
     public async Task<MenuScanResponse> CreateAsync(Guid userId, MenuScanRequest request, CancellationToken ct)
     {
         RequestValidation.MenuScan(request);
         var language = SupportedLanguages.NormalizeOrDefault(request.Language);
-        var text = string.IsNullOrWhiteSpace(request.OcrText) ? await ocr.ExtractTextAsync(request.ImageUrl, request.ImageBase64, ct) : request.OcrText!;
-        var interpretation = await ai.InterpretAsync(text, language, request.DiningContext, ct);
-        var scan = new MenuScan { UserId = userId, RestaurantPlaceId = request.RestaurantPlaceId, ImageUrl = request.ImageUrl, OcrText = text, Language = interpretation.DetectedLanguage, DiningContextJson = JsonText.Serialize(request.DiningContext ?? new Dictionary<string, object>()), RawAiResponseJson = JsonText.Serialize(interpretation) };
-        db.MenuScans.Add(scan);
-        foreach (var item in interpretation.Items) db.MenuScanItems.Add(new MenuScanItem { MenuScanId = scan.Id, Name = item.Name, Description = item.Description, Category = item.Category, PriceText = item.PriceText, DetectedLanguage = interpretation.DetectedLanguage, PossibleAllergensJson = JsonText.Serialize(item.PossibleAllergens), IsKidFriendly = item.IsKidFriendly, IsVegetarian = item.IsVegetarian, IsSpicy = item.IsSpicy });
-        foreach (var rec in interpretation.Recommendations) db.MenuScanRecommendations.Add(new MenuScanRecommendation { MenuScanId = scan.Id, ItemName = rec.ItemName, Reason = rec.Reason, SuitabilityScore = rec.SuitabilityScore, WarningsJson = JsonText.Serialize(rec.Warnings) });
-        await events.TrackAsync(userId, new InteractionEventRequest("MenuScanCreated", "MenuScan", scan.Id.ToString(), null), ct);
-        await db.SaveChangesAsync(ct);
-        return ToResponse(scan.Id, interpretation);
+        await quota.ReserveMenuScanAsync(userId, ct);
+        try
+        {
+            var text = string.IsNullOrWhiteSpace(request.OcrText) ? await ocr.ExtractTextAsync(request.ImageUrl, request.ImageBase64, ct) : request.OcrText!;
+            var interpretation = await ai.InterpretAsync(text, language, request.DiningContext, ct);
+            var scan = new MenuScan { UserId = userId, RestaurantPlaceId = request.RestaurantPlaceId, ImageUrl = request.ImageUrl, OcrText = text, Language = interpretation.DetectedLanguage, DiningContextJson = JsonText.Serialize(request.DiningContext ?? new Dictionary<string, object>()), RawAiResponseJson = JsonText.Serialize(interpretation) };
+            db.MenuScans.Add(scan);
+            foreach (var item in interpretation.Items) db.MenuScanItems.Add(new MenuScanItem { MenuScanId = scan.Id, Name = item.Name, Description = item.Description, Category = item.Category, PriceText = item.PriceText, DetectedLanguage = interpretation.DetectedLanguage, PossibleAllergensJson = JsonText.Serialize(item.PossibleAllergens), IsKidFriendly = item.IsKidFriendly, IsVegetarian = item.IsVegetarian, IsSpicy = item.IsSpicy });
+            foreach (var rec in interpretation.Recommendations) db.MenuScanRecommendations.Add(new MenuScanRecommendation { MenuScanId = scan.Id, ItemName = rec.ItemName, Reason = rec.Reason, SuitabilityScore = rec.SuitabilityScore, WarningsJson = JsonText.Serialize(rec.Warnings) });
+            await events.TrackAsync(userId, new InteractionEventRequest("MenuScanCreated", "MenuScan", scan.Id.ToString(), null), ct);
+            await db.SaveChangesAsync(ct);
+            return ToResponse(scan.Id, interpretation);
+        }
+        catch
+        {
+            await quota.ReleaseMenuScanAsync(userId, ct);
+            throw;
+        }
     }
     public async Task<MenuScanResponse> GetAsync(Guid userId, Guid id, CancellationToken ct)
     {
@@ -2118,13 +2492,14 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
     {
         var locale = NormalizeLocale(model.Locale);
         var name = DisplayName(model.DisplayName, locale);
+        var action = Action(locale, "first_decision", model.LinkUrl);
         var copy = locale switch
         {
-            "tr" => ("DineCue'ya hoş geldin", $"Merhaba {name}, DineCue yanında. Sana daha iyi sofralar, daha rahat seçimler ve daha keyifli anlar bulmanda yardımcı olacağız.", "DineCue'ya hoş geldin."),
-            "de" => ("Willkommen bei DineCue", $"Hallo {name}, DineCue ist an deiner Seite. Wir helfen dir, entspannter gute Orte und schöne Genussmomente zu finden.", "Willkommen bei DineCue."),
-            _ => ("Welcome to DineCue", $"Hi {name}, DineCue is here for you. We will help you find better tables, easier choices, and more memorable meals.", "Welcome to DineCue.")
+            "tr" => ("DineCue'ya hoş geldin", $"Merhaba {name}, DineCue yemek kararlarını ruh haline, yanında kim olduğuna, bütçene ve bulunduğun yere göre daha kolay vermene yardımcı olur.\n\nDineCue ile sana uygun mekanlar bulabilir, menüleri daha hızlı anlayabilir, bir restoranın o ana uyup uymadığını kontrol edebilir ve beğendiğin yerleri kaydedebilirsin.\n\nFree plan her ay 5 yemek kararı içerir.", "İyi kararlar küçük bir keyifle başlar."),
+            "de" => ("Willkommen bei DineCue", $"Hallo {name}, DineCue hilft dir, Essensentscheidungen nach Stimmung, Begleitung, Budget und Ort entspannter zu treffen.\n\nDu kannst passende Orte finden, Speisekarten schneller verstehen, prüfen, ob ein Restaurant gerade passt, und gute Orte für später speichern.\n\nDer Free Plan enthält jeden Monat 5 Essensentscheidungen.", "Gute Abende beginnen oft mit einer leichteren Entscheidung."),
+            _ => ("Welcome to DineCue", $"Hi {name}, DineCue helps you make dining decisions around your mood, company, budget, and location.\n\nYou can find places that fit, understand menus faster, check whether a restaurant suits the moment, and save places you like.\n\nThe Free plan includes 5 dining decisions each month.", "Good meals often start with an easier choice.")
         };
-        return Layout(locale, copy.Item1, copy.Item2, copy.Item3);
+        return Layout(locale, copy.Item1, copy.Item2, copy.Item3, action);
     }
 
     public RenderedEmailTemplate RenderEmailVerification(EmailTemplateModel model)
@@ -2138,7 +2513,33 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
             "de" => ("Dein Anmeldecode", $"Nutze diesen Code, um mit DineCue fortzufahren: {code}. Er ist {minutes} Minuten gültig.", "Wenn du das nicht warst, kannst du diese E-Mail einfach ignorieren."),
             _ => ("Your sign-in code", $"Use this code to continue with DineCue: {code}. It is valid for {minutes} minutes.", "If this was not you, you can ignore this email.")
         };
-        return Layout(locale, copy.Item1, copy.Item2, copy.Item3);
+        return Layout(locale, copy.Item1, copy.Item2, copy.Item3, highlight: code);
+    }
+
+    public RenderedEmailTemplate RenderMonthlyRecap(MonthlyRecapEmailModel model)
+    {
+        var locale = NormalizeLocale(model.Locale);
+        var count = Math.Max(1, model.DiningDecisionCount);
+        var month = WebUtility.HtmlEncode(model.MonthLabel);
+        var places = model.Places.Take(6).ToArray();
+        var placeLines = places.Select((x, i) => $"{i + 1}. {x.PlaceName} - {x.Headline}. {x.WhyThisPlace}").ToArray();
+        var placeHtml = string.Join("", places.Select(x => $"""
+        <tr>
+          <td style="padding:16px 0;border-top:1px solid #eadfd2">
+            <p style="margin:0 0 4px;font-size:16px;line-height:1.4;color:#19140f;font-weight:700">{WebUtility.HtmlEncode(x.PlaceName)}</p>
+            <p style="margin:0 0 6px;font-size:14px;line-height:1.5;color:#8a5d2d">{WebUtility.HtmlEncode(x.Headline)}</p>
+            <p style="margin:0;font-size:14px;line-height:1.55;color:#4b5563">{WebUtility.HtmlEncode(x.WhyThisPlace)}</p>
+          </td>
+        </tr>
+        """));
+        var action = Action(locale, "history", model.HistoryUrl);
+        var copy = locale switch
+        {
+            "tr" => ($"{month} yemek özetin", $"{month} boyunca DineCue ile {count} yemek kararı verdin. İşte bu ay karşına çıkan bazı yerler:\n\n{string.Join("\n", placeLines)}", "Bu özet yalnızca gerçek geçmişindeki kayıtlardan hazırlandı."),
+            "de" => ($"Dein Genussrückblick für {month}", $"Im {month} hast du mit DineCue {count} Essensentscheidungen getroffen. Hier sind einige Orte aus diesem Monat:\n\n{string.Join("\n", placeLines)}", "Dieser Rückblick basiert nur auf deiner gespeicherten Aktivität."),
+            _ => ($"Your {month} dining recap", $"In {month}, DineCue helped with {count} dining decisions. Here are a few places from your month:\n\n{string.Join("\n", placeLines)}", "This recap is built only from your real DineCue history.")
+        };
+        return Layout(locale, copy.Item1, copy.Item2, copy.Item3, action, placeHtml);
     }
 
     public RenderedEmailTemplate RenderContactFeedbackNotification(EmailTemplateModel model)
@@ -2174,26 +2575,49 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
         return locale switch { "tr" => "Merhaba", "de" => "du", _ => "there" };
     }
 
-    private static RenderedEmailTemplate Layout(string locale, string subject, string body, string note, (string Label, string Url)? action = null)
+    private static (string Label, string Url)? Action(string locale, string type, string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return null;
+        var label = (locale, type) switch
+        {
+            ("tr", "first_decision") => "İlk yemek kararını ver",
+            ("de", "first_decision") => "Erste Entscheidung treffen",
+            (_, "first_decision") => "Make your first dining decision",
+            ("tr", "history") => "Geçmişini gör",
+            ("de", "history") => "Verlauf ansehen",
+            _ => "View your history"
+        };
+        return (label, url);
+    }
+
+    private static RenderedEmailTemplate Layout(string locale, string subject, string body, string note, (string Label, string Url)? action = null, string? customHtml = null, string? highlight = null)
     {
         var title = WebUtility.HtmlEncode(subject);
-        var bodyHtml = WebUtility.HtmlEncode(body);
+        var bodyHtml = string.Join("<br><br>", WebUtility.HtmlEncode(body).Split("\n\n"));
         var noteHtml = WebUtility.HtmlEncode(note);
+        var highlightHtml = string.IsNullOrWhiteSpace(highlight)
+            ? ""
+            : $"""<div style="margin:24px 0;padding:18px 20px;border-radius:14px;background:#15110c;color:#f5c56b;font-size:30px;line-height:1;text-align:center;letter-spacing:8px;font-weight:800">{WebUtility.HtmlEncode(highlight)}</div>""";
         var actionHtml = action is null
             ? ""
-            : $"""<p style="margin:28px 0"><a href="{action.Value.Url}" style="background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:8px;display:inline-block">{WebUtility.HtmlEncode(action.Value.Label)}</a></p>""";
+            : $"""<p style="margin:28px 0"><a href="{WebUtility.HtmlEncode(action.Value.Url)}" style="background:#d6a84f;color:#16110b;text-decoration:none;padding:13px 20px;border-radius:10px;display:inline-block;font-weight:700">{WebUtility.HtmlEncode(action.Value.Label)}</a></p>""";
         var html = $$"""
 <!doctype html>
 <html lang="{{locale}}">
-<body style="margin:0;background:#f7f3ee;font-family:Inter,Segoe UI,Arial,sans-serif;color:#1f2933">
-  <div style="max-width:560px;margin:0 auto;padding:32px 20px">
-    <div style="background:#ffffff;border-radius:14px;padding:32px;border:1px solid #eadfd2">
-      <p style="margin:0 0 20px;color:#9a6b3f;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:12px">DineCue</p>
-      <h1 style="margin:0 0 16px;font-size:24px;line-height:1.25;color:#161a1d">{{title}}</h1>
-      <p style="margin:0 0 18px;font-size:16px;line-height:1.6">{{bodyHtml}}</p>
-      {{actionHtml}}
-      <p style="margin:24px 0 0;font-size:14px;line-height:1.5;color:#667085">{{noteHtml}}</p>
+<body style="margin:0;background:#19140f;font-family:Inter,Segoe UI,Arial,sans-serif;color:#f6efe6">
+  <div style="max-width:620px;margin:0 auto;padding:34px 18px">
+    <div style="padding:0 0 18px">
+      <p style="margin:0;color:#f5c56b;font-weight:800;letter-spacing:.12em;text-transform:uppercase;font-size:13px">DineCue</p>
     </div>
+    <div style="background:#fffaf3;border-radius:18px;padding:34px;border:1px solid #d9b56b;color:#19140f">
+      <h1 style="margin:0 0 16px;font-size:26px;line-height:1.25;color:#19140f">{{title}}</h1>
+      <p style="margin:0 0 18px;font-size:16px;line-height:1.65;color:#374151">{{bodyHtml}}</p>
+      {{highlightHtml}}
+      {{customHtml}}
+      {{actionHtml}}
+      <p style="margin:24px 0 0;font-size:14px;line-height:1.55;color:#6b7280">{{noteHtml}}</p>
+    </div>
+    <p style="margin:18px 0 0;font-size:12px;line-height:1.5;color:#b9a991">DineCue</p>
   </div>
 </body>
 </html>
@@ -2203,6 +2627,142 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
             : $"{subject}\n\n{body}\n\n{action.Value.Label}: {action.Value.Url}\n\n{note}";
         return new RenderedEmailTemplate(subject, html, text);
     }
+}
+
+public sealed class EmailNotificationService(
+    DineCueDbContext db,
+    IEmailSender sender,
+    IEmailTemplateRenderer templates,
+    Microsoft.Extensions.Options.IOptions<EmailOptions> emailOptions,
+    Microsoft.Extensions.Options.IOptions<ProductEmailOptions> productOptions,
+    ILogger<EmailNotificationService> logger) : IEmailNotificationService
+{
+    public async Task SendWelcomeAsync(UserDto user, CancellationToken cancellationToken)
+    {
+        if (!productOptions.Value.WelcomeEnabled) return;
+        var periodKey = "once";
+        var existing = await db.EmailDeliveryLedgers.FirstOrDefaultAsync(x => x.UserId == user.Id && x.EmailType == "welcome" && x.PeriodKey == periodKey, cancellationToken);
+        if (existing?.Status == "sent") return;
+        if (existing == null)
+        {
+            existing = new EmailDeliveryLedger { UserId = user.Id, EmailType = "welcome", PeriodKey = periodKey };
+            db.EmailDeliveryLedgers.Add(existing);
+        }
+
+        var appUrl = TrimEnd(emailOptions.Value.AppBaseUrl);
+        var rendered = templates.RenderWelcome(new EmailTemplateModel(user.PreferredLanguage, user.DisplayName, LinkUrl: string.IsNullOrWhiteSpace(appUrl) ? null : $"{appUrl}/app/find"));
+        var result = await sender.SendAsync(new EmailMessage(user.Email, rendered.Subject, rendered.HtmlBody, rendered.TextBody, EmailTemplateRenderer.NormalizeLocale(user.PreferredLanguage), new Dictionary<string, string> { ["template"] = "welcome" }), cancellationToken);
+        existing.Status = result.Succeeded ? "sent" : "failed";
+        existing.SentAt = result.Succeeded ? DateTimeOffset.UtcNow : null;
+        existing.ProviderMessageId = result.ProviderMessageId;
+        existing.ErrorCode = result.ErrorCode;
+        existing.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(cancellationToken);
+
+        if (!result.Succeeded)
+            logger.LogWarning("Welcome email failed for user {UserId} with {ErrorCode}.", user.Id, result.ErrorCode);
+    }
+
+    private static string TrimEnd(string value) => string.IsNullOrWhiteSpace(value) ? "" : value.TrimEnd('/');
+}
+
+public sealed class MonthlyRecapEmailService(
+    DineCueDbContext db,
+    IEmailSender sender,
+    IEmailTemplateRenderer templates,
+    Microsoft.Extensions.Options.IOptions<EmailOptions> emailOptions,
+    Microsoft.Extensions.Options.IOptions<ProductEmailOptions> productOptions,
+    ILogger<MonthlyRecapEmailService> logger) : IMonthlyRecapEmailService
+{
+    public async Task<int> SendMonthlyRecapsAsync(string periodKey, CancellationToken cancellationToken)
+    {
+        if (!productOptions.Value.MonthlyRecapEnabled) return 0;
+        var (start, end) = Period(periodKey);
+        var sessions = await db.RecommendationSessions.AsNoTracking()
+            .Where(x => x.Status == "completed" && x.CompletedAt >= start && x.CompletedAt < end)
+            .ToListAsync(cancellationToken);
+        var userIds = sessions.Select(x => x.UserId).Distinct().ToArray();
+        var sent = 0;
+        foreach (var userId in userIds)
+        {
+            try
+            {
+                if (await SendForUserAsync(userId, periodKey, start, end, cancellationToken))
+                    sent++;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(ex, "Monthly recap failed for user {UserId} and period {PeriodKey}.", userId, periodKey);
+            }
+        }
+        return sent;
+    }
+
+    private async Task<bool> SendForUserAsync(Guid userId, string periodKey, DateTimeOffset start, DateTimeOffset end, CancellationToken ct)
+    {
+        var user = await db.Users.AsNoTracking().FirstOrDefaultAsync(x => x.Id == userId && x.DeletedAt == null, ct);
+        if (user == null) return false;
+        var preference = await db.NotificationPreferences.AsNoTracking().FirstOrDefaultAsync(x => x.UserId == userId, ct);
+        var enabled = preference?.MonthlyRecapEnabled ?? productOptions.Value.MonthlyRecapEnabledByDefault;
+        if (!enabled) return false;
+
+        var existing = await db.EmailDeliveryLedgers.FirstOrDefaultAsync(x => x.UserId == userId && x.EmailType == "monthly_recap" && x.PeriodKey == periodKey, ct);
+        if (existing?.Status == "sent") return false;
+
+        var sessions = await db.RecommendationSessions.AsNoTracking()
+            .Where(x => x.UserId == userId && x.Status == "completed" && x.CompletedAt >= start && x.CompletedAt < end)
+            .OrderBy(x => x.CompletedAt)
+            .ToListAsync(ct);
+        if (sessions.Count == 0) return false;
+        var sessionIds = sessions.Select(x => x.Id).ToArray();
+        var results = await db.RecommendationResults.AsNoTracking().Where(x => sessionIds.Contains(x.SessionId)).OrderBy(x => x.Rank).ToListAsync(ct);
+        if (results.Count == 0) return false;
+        var candidateIds = results.Select(x => x.CandidateId).Distinct().ToArray();
+        var candidates = await db.RecommendationCandidates.AsNoTracking().Where(x => candidateIds.Contains(x.Id)).ToListAsync(ct);
+        var places = results
+            .Select(x => new { Result = x, Candidate = candidates.FirstOrDefault(c => c.Id == x.CandidateId) })
+            .Where(x => x.Candidate != null)
+            .GroupBy(x => x.Candidate!.ProviderPlaceId)
+            .Select(g => g.First())
+            .Take(5)
+            .Select(x => new MonthlyRecapPlaceEmailModel(x.Candidate!.Name, x.Result.Headline, x.Result.WhyThisPlace))
+            .ToArray();
+        if (places.Length == 0) return false;
+
+        existing ??= new EmailDeliveryLedger { UserId = userId, EmailType = "monthly_recap", PeriodKey = periodKey };
+        if (db.Entry(existing).State == EntityState.Detached)
+            db.EmailDeliveryLedgers.Add(existing);
+
+        var appUrl = TrimEnd(emailOptions.Value.AppBaseUrl);
+        var historyUrl = string.IsNullOrWhiteSpace(appUrl) ? null : appUrl + productOptions.Value.HistoryUrlPath;
+        var rendered = templates.RenderMonthlyRecap(new MonthlyRecapEmailModel(user.PreferredLanguage, MonthLabel(start, user.PreferredLanguage), sessions.Count, places, historyUrl, user.DisplayName));
+        var result = await sender.SendAsync(new EmailMessage(user.Email, rendered.Subject, rendered.HtmlBody, rendered.TextBody, EmailTemplateRenderer.NormalizeLocale(user.PreferredLanguage), new Dictionary<string, string> { ["template"] = "monthly_recap", ["period"] = periodKey }), ct);
+        existing.Status = result.Succeeded ? "sent" : "failed";
+        existing.SentAt = result.Succeeded ? DateTimeOffset.UtcNow : null;
+        existing.ProviderMessageId = result.ProviderMessageId;
+        existing.ErrorCode = result.ErrorCode;
+        existing.UpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(ct);
+        return result.Succeeded;
+    }
+
+    private static (DateTimeOffset Start, DateTimeOffset End) Period(string periodKey)
+    {
+        var parts = periodKey.Split('-', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 2 || !int.TryParse(parts[0], out var year) || !int.TryParse(parts[1], out var month))
+            throw new ApiException("validation_error", "A valid period key is required.", 400);
+        var start = new DateTimeOffset(year, month, 1, 0, 0, 0, TimeSpan.Zero);
+        return (start, start.AddMonths(1));
+    }
+
+    private static string MonthLabel(DateTimeOffset start, string locale) => EmailTemplateRenderer.NormalizeLocale(locale) switch
+    {
+        "tr" => $"{start:yyyy-MM}",
+        "de" => $"{start:MM.yyyy}",
+        _ => $"{start:MMMM yyyy}"
+    };
+
+    private static string TrimEnd(string value) => string.IsNullOrWhiteSpace(value) ? "" : value.TrimEnd('/');
 }
 
 public sealed class DevelopmentEmailSender(
@@ -2240,6 +2800,8 @@ public sealed class ResendEmailSender(
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.TimeoutSeconds, 1, 60)));
         using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.resend.com/emails");
         request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ResendApiKey);
+        if (!string.IsNullOrWhiteSpace(config.ReplyToEmail))
+            request.Headers.TryAddWithoutValidation("Reply-To", config.ReplyToEmail.Trim());
         request.Content = new StringContent(JsonText.Serialize(new
         {
             from = $"{config.FromName} <{config.FromEmail}>",
@@ -2279,6 +2841,58 @@ public sealed class ResendEmailSender(
         var rendered = templates.RenderEmailVerification(new EmailTemplateModel(normalizedLocale, Code: code, ExpiresInMinutes: otpOptions.Value.ExpiryMinutes));
         return SendAsync(new EmailMessage(email, rendered.Subject, rendered.HtmlBody, rendered.TextBody, normalizedLocale, new Dictionary<string, string> { ["template"] = "email_verification" }), cancellationToken);
     }
+}
+
+public sealed class GoogleAuthValidator(
+    Microsoft.Extensions.Options.IOptions<GoogleAuthOptions> options,
+    ILogger<GoogleAuthValidator> logger) : IGoogleAuthValidator
+{
+    public async Task<GoogleUserInfo> ValidateAsync(string token, CancellationToken cancellationToken)
+    {
+        var config = options.Value;
+        var audiences = config.EffectiveAllowedAudiences();
+        if (!config.Enabled || audiences.Length == 0)
+            throw new ApiException("invalid_google_credential", "Google sign-in could not be completed.", 401);
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.TimeoutSeconds, 1, 30)));
+            var payload = await GoogleJsonWebSignature.ValidateAsync(token, new GoogleJsonWebSignature.ValidationSettings
+            {
+                Audience = audiences
+            }).WaitAsync(timeoutCts.Token);
+            if (string.IsNullOrWhiteSpace(payload.Subject) ||
+                string.IsNullOrWhiteSpace(payload.Email) ||
+                payload.ExpirationTimeSeconds is null ||
+                DateTimeOffset.FromUnixTimeSeconds(payload.ExpirationTimeSeconds.Value) <= DateTimeOffset.UtcNow ||
+                payload.EmailVerified != true)
+                throw Invalid();
+
+            return new GoogleUserInfo(
+                payload.Subject,
+                RequestValidation.Email(payload.Email),
+                payload.Name,
+                payload.Picture);
+        }
+        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "Google credential verification timed out.");
+            throw Invalid();
+        }
+        catch (ApiException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Google credential verification failed with {FailureType}.", ex.GetType().Name);
+            throw Invalid();
+        }
+    }
+
+    private static ApiException Invalid() =>
+        new("invalid_google_credential", "Google sign-in could not be completed.", 401);
 }
 
 internal sealed class MockGoogleAuthValidator(IHostEnvironment environment) : IGoogleAuthValidator

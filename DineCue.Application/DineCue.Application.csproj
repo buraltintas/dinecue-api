@@ -4,7 +4,4 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\DineCue.Domain\DineCue.Domain.csproj" />
-  </ItemGroup>
 </Project>

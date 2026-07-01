@@ -135,6 +135,15 @@ public sealed record EmailMessage(
     string Locale,
     Dictionary<string, string>? Metadata = null);
 public sealed record EmailSendResult(bool Succeeded, string? ProviderMessageId = null, string? ErrorCode = null);
+public sealed record QuotaStateResponse(
+    string Plan,
+    int MonthlyLimit,
+    int UsedThisPeriod,
+    int RemainingThisPeriod,
+    string PeriodKey,
+    DateTimeOffset PeriodEndsAt,
+    bool ProAvailable,
+    string ProStatus);
 public sealed record EmailTemplateModel(
     string Locale,
     string? DisplayName = null,
@@ -143,17 +152,34 @@ public sealed record EmailTemplateModel(
     int? ExpiresInMinutes = null,
     string? SenderEmail = null,
     string? Message = null);
+public sealed record MonthlyRecapPlaceEmailModel(string PlaceName, string Headline, string WhyThisPlace);
+public sealed record MonthlyRecapEmailModel(
+    string Locale,
+    string MonthLabel,
+    int DiningDecisionCount,
+    IReadOnlyList<MonthlyRecapPlaceEmailModel> Places,
+    string? HistoryUrl = null,
+    string? DisplayName = null);
 public sealed record RenderedEmailTemplate(string Subject, string HtmlBody, string TextBody);
 public interface IEmailTemplateRenderer
 {
     RenderedEmailTemplate RenderWelcome(EmailTemplateModel model);
     RenderedEmailTemplate RenderEmailVerification(EmailTemplateModel model);
+    RenderedEmailTemplate RenderMonthlyRecap(MonthlyRecapEmailModel model);
     RenderedEmailTemplate RenderContactFeedbackNotification(EmailTemplateModel model);
 }
 public interface IEmailSender
 {
     Task<EmailSendResult> SendAsync(EmailMessage message, CancellationToken cancellationToken);
     Task<EmailSendResult> SendOtpAsync(string email, string code, string? locale, CancellationToken cancellationToken);
+}
+public interface IEmailNotificationService
+{
+    Task SendWelcomeAsync(UserDto user, CancellationToken cancellationToken);
+}
+public interface IMonthlyRecapEmailService
+{
+    Task<int> SendMonthlyRecapsAsync(string periodKey, CancellationToken cancellationToken);
 }
 public interface IGoogleAuthValidator { Task<GoogleUserInfo> ValidateAsync(string token, CancellationToken cancellationToken); }
 public interface ITokenService
@@ -176,7 +202,16 @@ public interface IAiIntentParser { Task<ParsedIntent> ParseAsync(string rawText,
 public interface IAiPlaceRanker { Task<IReadOnlyList<RankedPlace>> RankAsync(ParsedIntent intent, IReadOnlyList<PlaceCandidate> candidates, WeatherContext weather, CancellationToken cancellationToken); }
 public interface IAiRestaurantFitAnalyzer { Task<RestaurantFitCheckResponse> AnalyzeAsync(PlaceCandidate restaurant, RestaurantFitCheckRequest request, ReservationDto reservation, CancellationToken cancellationToken); }
 public interface IAiMenuInterpreter { Task<MenuInterpretation> InterpretAsync(string text, string language, Dictionary<string, object>? diningContext, CancellationToken cancellationToken); }
-public interface IQuotaService { Task CheckAndConsumeRecommendationAsync(Guid userId, CancellationToken cancellationToken); }
+public interface IQuotaService
+{
+    Task<QuotaStateResponse> GetAsync(Guid userId, CancellationToken cancellationToken);
+    Task<QuotaStateResponse> ReserveRecommendationAsync(Guid userId, CancellationToken cancellationToken);
+    Task<QuotaStateResponse> ReserveMenuScanAsync(Guid userId, CancellationToken cancellationToken);
+    Task<QuotaStateResponse> ReserveRestaurantFitCheckAsync(Guid userId, CancellationToken cancellationToken);
+    Task ReleaseRecommendationAsync(Guid userId, CancellationToken cancellationToken);
+    Task ReleaseMenuScanAsync(Guid userId, CancellationToken cancellationToken);
+    Task ReleaseRestaurantFitCheckAsync(Guid userId, CancellationToken cancellationToken);
+}
 public interface IReservationLinkResolver { Task<ReservationDto> ResolveAsync(PlaceCandidate place, CancellationToken cancellationToken); }
 public interface ISubscriptionProvider { Task<bool> HasActiveProAsync(Guid userId, CancellationToken cancellationToken); }
 public interface IPlaceSearchProvider { Task<IReadOnlyList<PlaceCandidate>> SearchAsync(DiningIntent intent, CancellationToken cancellationToken); }

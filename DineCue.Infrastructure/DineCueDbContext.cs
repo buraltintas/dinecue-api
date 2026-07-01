@@ -14,6 +14,9 @@ public sealed class DineCueDbContext(DbContextOptions<DineCueDbContext> options)
     public DbSet<DiningProfile> DiningProfiles => Set<DiningProfile>();
     public DbSet<OnboardingState> OnboardingStates => Set<OnboardingState>();
     public DbSet<DailyUsage> DailyUsages => Set<DailyUsage>();
+    public DbSet<IdentityUsageLedger> IdentityUsageLedgers => Set<IdentityUsageLedger>();
+    public DbSet<EmailDeliveryLedger> EmailDeliveryLedgers => Set<EmailDeliveryLedger>();
+    public DbSet<NotificationPreference> NotificationPreferences => Set<NotificationPreference>();
     public DbSet<Subscription> Subscriptions => Set<Subscription>();
     public DbSet<RecommendationSession> RecommendationSessions => Set<RecommendationSession>();
     public DbSet<RecommendationCandidate> RecommendationCandidates => Set<RecommendationCandidate>();
@@ -47,6 +50,7 @@ public sealed class DineCueDbContext(DbContextOptions<DineCueDbContext> options)
             e.ToTable("user_identities");
             e.HasIndex(x => new { x.Provider, x.ProviderUserId }).IsUnique();
             e.Property(x => x.Provider).HasMaxLength(64);
+            e.Property(x => x.Email).HasMaxLength(320);
         });
 
         b.Entity<EmailOtp>(e =>
@@ -92,6 +96,31 @@ public sealed class DineCueDbContext(DbContextOptions<DineCueDbContext> options)
             e.ToTable("daily_usages");
             e.HasIndex(x => new { x.UserId, x.UsageDate }).IsUnique();
             e.HasOne<User>().WithMany().HasForeignKey(x => x.UserId);
+        });
+
+        b.Entity<IdentityUsageLedger>(e =>
+        {
+            e.ToTable("identity_usage_ledgers");
+            e.HasIndex(x => new { x.KeyType, x.KeyHash, x.PeriodStart }).IsUnique();
+            e.Property(x => x.KeyType).HasMaxLength(64);
+            e.Property(x => x.KeyHash).HasMaxLength(128);
+        });
+
+        b.Entity<EmailDeliveryLedger>(e =>
+        {
+            e.ToTable("email_delivery_ledgers");
+            e.HasIndex(x => new { x.UserId, x.EmailType, x.PeriodKey }).IsUnique();
+            e.Property(x => x.EmailType).HasMaxLength(64);
+            e.Property(x => x.PeriodKey).HasMaxLength(16);
+            e.Property(x => x.Status).HasMaxLength(32);
+            e.HasOne<User>().WithMany().HasForeignKey(x => x.UserId);
+        });
+
+        b.Entity<NotificationPreference>(e =>
+        {
+            e.ToTable("notification_preferences");
+            e.HasKey(x => x.UserId);
+            e.HasOne<User>().WithOne().HasForeignKey<NotificationPreference>(x => x.UserId);
         });
 
         b.Entity<Subscription>(e =>

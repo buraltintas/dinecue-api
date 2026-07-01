@@ -32,6 +32,7 @@ public sealed class UserIdentity : Entity
     public string ProviderUserId { get; set; } = "";
     public string Email { get; set; } = "";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? LastUsedAt { get; set; }
 }
 
 public sealed class EmailOtp : Entity
@@ -113,6 +114,39 @@ public sealed class DailyUsage : Entity
     public int RecommendationSessionCount { get; set; }
     public int MenuScanCount { get; set; }
     public int FitCheckCount { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class IdentityUsageLedger : Entity
+{
+    public string KeyType { get; set; } = "";
+    public string KeyHash { get; set; } = "";
+    public DateOnly PeriodStart { get; set; }
+    public int RecommendationSessionCount { get; set; }
+    public int MenuScanCount { get; set; }
+    public int FitCheckCount { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class EmailDeliveryLedger : Entity
+{
+    public Guid UserId { get; set; }
+    public string EmailType { get; set; } = "";
+    public string PeriodKey { get; set; } = "";
+    public string Status { get; set; } = "pending";
+    public DateTimeOffset? SentAt { get; set; }
+    public string? ProviderMessageId { get; set; }
+    public string? ErrorCode { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class NotificationPreference
+{
+    public Guid UserId { get; set; }
+    public bool MonthlyRecapEnabled { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
