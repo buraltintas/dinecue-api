@@ -1,12 +1,38 @@
 using DineCue.Api;
 using DineCue.Application;
 using DineCue.Infrastructure;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllers();
+builder.Services.AddControllers()
+    .ConfigureApiBehaviorOptions(options =>
+    {
+        options.InvalidModelStateResponseFactory = context =>
+        {
+            var fields = context.ModelState
+                .Where(x => x.Value?.Errors.Count > 0)
+                .Select(x => string.IsNullOrWhiteSpace(x.Key) ? "body" : x.Key)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var logger = context.HttpContext.RequestServices
+                .GetRequiredService<ILoggerFactory>()
+                .CreateLogger("DineCue.Api.ModelValidation");
+
+            logger.LogWarning(
+                "API model validation failed for {Method} {Path}. Fields={Fields}",
+                context.HttpContext.Request.Method,
+                context.HttpContext.Request.Path.Value,
+                fields);
+
+            return new BadRequestObjectResult(new ApiErrorEnvelope(new ApiError(
+                "validation_error",
+                "The request body is invalid.",
+                new { fields })));
+        };
+    });
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddRateLimiter(options =>
 {
