@@ -66,7 +66,7 @@ static string PartitionKey(HttpContext context, string policy)
     return $"{policy}:{user ?? ip}";
 }
 
-internal sealed class ApiExceptionMiddleware(RequestDelegate next)
+internal sealed class ApiExceptionMiddleware(RequestDelegate next, ILogger<ApiExceptionMiddleware> logger)
 {
     public async Task InvokeAsync(HttpContext context)
     {
@@ -85,6 +85,15 @@ internal sealed class ApiExceptionMiddleware(RequestDelegate next)
                 InvalidOperationException => (StatusCodes.Status400BadRequest, "invalid_operation", "The request could not be completed.", null),
                 _ => (StatusCodes.Status500InternalServerError, "internal_error", "An unexpected error occurred.", null)
             };
+            logger.Log(
+                ex is ApiException ? LogLevel.Warning : LogLevel.Error,
+                ex,
+                "API exception mapped to {Code} with status {StatusCode} for {Method} {Path}. ExceptionType={ExceptionType}",
+                code,
+                status,
+                context.Request.Method,
+                context.Request.Path.Value,
+                ex.GetType().Name);
             context.Response.StatusCode = status;
             await context.Response.WriteAsJsonAsync(new ApiErrorEnvelope(new ApiError(code, message, details ?? new { })));
         }

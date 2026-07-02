@@ -141,6 +141,37 @@ public sealed class QuotaServiceTests
     }
 
     [Fact]
+    public async Task RecommendationCreate_QueuesCurrentLocationRequestImmediately()
+    {
+        await using var db = CreateDb();
+        var quota = CreateService(db);
+        var queue = new RecordingRecommendationJobQueue();
+        var service = new RecommendationService(db, quota, queue, new NoopInteractionEventService());
+        var userId = Guid.NewGuid();
+        var request = new RecommendationSessionRequest(
+            "6 kişiyiz, 2 çocuk sadece biraz rakı içip et yemek istiyoruz. çocuklar da mutlu olabilmeli",
+            new LocationInput("current", null, 36.95982, 30.60710, null),
+            ["dinner", "drinks", "family", "budget"],
+            "tr",
+            new Dictionary<string, object>
+            {
+                ["partySize"] = 6,
+                ["withKids"] = true,
+                ["meal"] = "dinner"
+            });
+
+        var response = await service.CreateAsync(userId, request, CancellationToken.None);
+
+        Assert.Equal("queued", response.Status);
+        Assert.Equal(1, queue.EnqueueCount);
+        var session = Assert.Single(db.RecommendationSessions);
+        Assert.Equal("current", session.LocationMode);
+        Assert.Equal(36.95982, session.Latitude);
+        Assert.Equal(30.60710, session.Longitude);
+        Assert.Equal("tr", session.Language);
+    }
+
+    [Fact]
     public void ProfileDto_ExposesPlanAndRemainingQuotaForFrontend()
     {
         var profile = new ProfileDto(
