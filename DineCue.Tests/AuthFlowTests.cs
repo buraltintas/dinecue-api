@@ -53,6 +53,20 @@ public sealed class AuthFlowTests
     }
 
     [Fact]
+    public async Task EmailOtpVerify_AcceptsPastedCodeWithWhitespace()
+    {
+        await using var db = CreateDb();
+        var service = CreateAuth(db, emailSender: new CapturingEmailSender(), environmentName: Environments.Development, exposeDevOtp: true);
+        var start = await service.StartEmailAsync(new EmailStartRequest("paste@example.com"), CancellationToken.None);
+        var pastedCode = $" {start.DevOtp![..3]} {start.DevOtp[3..]} \n";
+
+        var login = await service.VerifyEmailAsync(new EmailVerifyRequest("paste@example.com", pastedCode), CancellationToken.None);
+
+        Assert.True(login.IsNewUser);
+        Assert.Equal("paste@example.com", login.User.Email);
+    }
+
+    [Fact]
     public async Task EmailOtpVerify_SendsWelcomeOnceAfterFirstAccountCreation()
     {
         await using var db = CreateDb();

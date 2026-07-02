@@ -358,10 +358,12 @@ internal static partial class RequestValidation
         return normalized;
     }
 
-    public static void Otp(string code)
+    public static string Otp(string code)
     {
-        if (string.IsNullOrWhiteSpace(code) || !OtpRegex().IsMatch(code))
+        var normalized = OtpNonDigitRegex().Replace(code ?? "", "");
+        if (!OtpRegex().IsMatch(normalized))
             throw Invalid("A valid 6-digit OTP code is required.", new { field = "code" });
+        return normalized;
     }
 
     public static void Language(string? language)
@@ -531,6 +533,8 @@ internal static partial class RequestValidation
     private static partial Regex EmailRegex();
     [GeneratedRegex(@"^\d{6}$", RegexOptions.CultureInvariant)]
     private static partial Regex OtpRegex();
+    [GeneratedRegex(@"\D+", RegexOptions.CultureInvariant)]
+    private static partial Regex OtpNonDigitRegex();
     [GeneratedRegex(@"^[A-Z]{3}$", RegexOptions.CultureInvariant)]
     private static partial Regex CurrencyRegex();
 }
@@ -670,13 +674,13 @@ internal sealed class AuthService(
         if (request == null) throw new ApiException("validation_error", "Request body is required.", 400, new { field = "body" });
         var email = NormalizeEmail(request.Email);
         var preferredLanguage = RequestValidation.PreferredLanguageOrDefault(request.PreferredLanguage);
-        RequestValidation.Otp(request.Code);
+        var code = RequestValidation.Otp(request.Code);
         otpRateLimiter.CheckVerify(email);
         var otp = await db.EmailOtps.OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync(x => x.Email == email && x.ConsumedAt == null, ct)
             ?? throw new ApiException("invalid_otp", "The OTP is invalid or expired.", 400);
         if (otp.ExpiresAt <= DateTimeOffset.UtcNow) throw new ApiException("invalid_otp", "The OTP is invalid or expired.", 400);
         if (otp.AttemptCount >= otpOptions.Value.MaxAttempts) throw new ApiException("too_many_attempts", "Too many attempts. Please try again later.", 429);
-        if (otp.CodeHash != tokens.HashOtp(email, request.Code))
+        if (otp.CodeHash != tokens.HashOtp(email, code))
         {
             otp.AttemptCount++;
             await db.SaveChangesAsync(ct);
