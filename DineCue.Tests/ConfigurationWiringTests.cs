@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System.Text.RegularExpressions;
 using Xunit;
 
 namespace DineCue.Tests;
@@ -134,6 +135,41 @@ public sealed class ConfigurationWiringTests
         Assert.Contains("PreferredLanguage", properties);
     }
 
+    [Fact]
+    public void RecommendationLocationValidation_AcceptsSupportedModes()
+    {
+        var cases = new[]
+        {
+            new LocationInput("text", "Selanik", null, null, null),
+            new LocationInput("current", null, 40.9909, 29.0303, null),
+            new LocationInput("map_pin", "Selanik", 40.6401, 22.9444, null),
+            new LocationInput("place", "Selanik", null, null, "google-place-id")
+        };
+
+        foreach (var location in cases)
+        {
+            RequestValidation.Recommendation(new RecommendationSessionRequest("Dinner", location, [], "en", null));
+        }
+    }
+
+    [Fact]
+    public void ApiRateLimiterPolicies_AreRegisteredForEveryEndpointPolicy()
+    {
+        var repoRoot = FindRepoRoot();
+        var apiDir = Path.Combine(repoRoot, "DineCue.Api");
+        var program = File.ReadAllText(Path.Combine(apiDir, "Program.cs"));
+        var registered = Regex.Matches(program, "AddPolicy\\(\"([^\"]+)\"")
+            .Select(x => x.Groups[1].Value)
+            .ToHashSet(StringComparer.Ordinal);
+        var used = Directory.EnumerateFiles(apiDir, "*.cs", SearchOption.AllDirectories)
+            .SelectMany(path => Regex.Matches(File.ReadAllText(path), "EnableRateLimiting\\(\"([^\"]+)\""))
+            .Select(x => x.Groups[1].Value)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.Contains("recommendations", registered);
+        Assert.Empty(used.Except(registered));
+    }
+
     private static IConfiguration BaseConfig(Dictionary<string, string?> overrides)
     {
         var values = new Dictionary<string, string?>
@@ -148,6 +184,14 @@ public sealed class ConfigurationWiringTests
         foreach (var pair in overrides)
             values[pair.Key] = pair.Value;
         return new ConfigurationBuilder().AddInMemoryCollection(values).Build();
+    }
+
+    private static string FindRepoRoot()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        while (current != null && !File.Exists(Path.Combine(current.FullName, "DineCue.sln")))
+            current = current.Parent;
+        return current?.FullName ?? throw new InvalidOperationException("Could not find repository root.");
     }
 
     private sealed class TestEnvironment(string name) : IHostEnvironment

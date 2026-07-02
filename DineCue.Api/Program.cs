@@ -20,6 +20,21 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("otp-verify", context => RateLimitPartition.GetFixedWindowLimiter(
         PartitionKey(context, "otp-verify"),
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(10), QueueLimit = 0 }));
+    options.AddPolicy("recommendations", context => RateLimitPartition.GetFixedWindowLimiter(
+        PartitionKey(context, "recommendations"),
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 30, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
+    options.AddPolicy("general", context => RateLimitPartition.GetFixedWindowLimiter(
+        PartitionKey(context, "general"),
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 60, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
+    options.AddPolicy("fit-check", context => RateLimitPartition.GetFixedWindowLimiter(
+        PartitionKey(context, "fit-check"),
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 20, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
+    options.AddPolicy("menu-scans", context => RateLimitPartition.GetFixedWindowLimiter(
+        PartitionKey(context, "menu-scans"),
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
+    options.AddPolicy("events", context => RateLimitPartition.GetFixedWindowLimiter(
+        PartitionKey(context, "events"),
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 120, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
 });
 builder.Services.AddDineCueInfrastructure(builder.Configuration, builder.Environment);
 
