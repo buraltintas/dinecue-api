@@ -3,6 +3,7 @@ using DineCue.Domain;
 using DineCue.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
 
@@ -128,7 +129,7 @@ public sealed class QuotaServiceTests
         var userId = Guid.NewGuid();
         await quota.ReserveRecommendationAsync(userId, CancellationToken.None);
         var queue = new RecordingRecommendationJobQueue();
-        var service = new RecommendationService(db, quota, queue, new NoopInteractionEventService());
+        var service = new RecommendationService(db, quota, queue, new NoopInteractionEventService(), NullLogger<RecommendationService>.Instance);
 
         var error = await Assert.ThrowsAsync<ApiException>(() => service.CreateAsync(
             userId,
@@ -146,7 +147,7 @@ public sealed class QuotaServiceTests
         await using var db = CreateDb();
         var quota = CreateService(db);
         var queue = new RecordingRecommendationJobQueue();
-        var service = new RecommendationService(db, quota, queue, new NoopInteractionEventService());
+        var service = new RecommendationService(db, quota, queue, new NoopInteractionEventService(), NullLogger<RecommendationService>.Instance);
         var userId = Guid.NewGuid();
         var request = new RecommendationSessionRequest(
             "6 kişiyiz, 2 çocuk sadece biraz rakı içip et yemek istiyoruz. çocuklar da mutlu olabilmeli",

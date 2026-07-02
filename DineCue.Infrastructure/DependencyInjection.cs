@@ -1163,13 +1163,24 @@ internal sealed class RecommendationService(
     DineCueDbContext db,
     IQuotaService quota,
     IRecommendationJobQueue jobQueue,
-    IInteractionEventService events) : IRecommendationService
+    IInteractionEventService events,
+    ILogger<RecommendationService> logger) : IRecommendationService
 {
     public async Task<RecommendationSessionAcceptedResponse> CreateAsync(Guid userId, RecommendationSessionRequest request, CancellationToken ct)
     {
+        logger.LogInformation(
+            "Recommendation create started for user {UserId}. LocationMode={LocationMode}, HasCoordinates={HasCoordinates}, CueCount={CueCount}, Language={Language}",
+            userId,
+            request.Location?.Mode,
+            request.Location?.Lat is not null && request.Location?.Lng is not null,
+            request.SelectedCues?.Length ?? 0,
+            request.Language);
         RequestValidation.Recommendation(request);
+        logger.LogInformation("Recommendation request validation passed for user {UserId}", userId);
         var language = SupportedLanguages.NormalizeOrDefault(request.Language);
+        logger.LogInformation("Recommendation quota reservation starting for user {UserId}", userId);
         await quota.ReserveRecommendationAsync(userId, ct);
+        logger.LogInformation("Recommendation quota reservation completed for user {UserId}", userId);
         var cues = request.SelectedCues ?? [];
         var location = request.Location ?? new LocationInput("current", null, null, null, null);
 
@@ -1190,12 +1201,16 @@ internal sealed class RecommendationService(
                 Status = "queued"
             };
             db.RecommendationSessions.Add(session);
+            logger.LogInformation("Recommendation session save starting for user {UserId}", userId);
             await db.SaveChangesAsync(ct);
+            logger.LogInformation("Recommendation session saved with id {SessionId} for user {UserId}", session.Id, userId);
             await jobQueue.EnqueueAsync(new RecommendationJob(session.Id, userId), ct);
+            logger.LogInformation("Recommendation job enqueued for session {SessionId}", session.Id);
             return new RecommendationSessionAcceptedResponse(session.Id, session.Status, $"/recommendation-sessions/{session.Id}");
         }
-        catch
+        catch (Exception ex)
         {
+            logger.LogWarning(ex, "Recommendation create failed after quota reservation for user {UserId}. ExceptionType={ExceptionType}", userId, ex.GetType().Name);
             await quota.ReleaseRecommendationAsync(userId, ct);
             throw;
         }
