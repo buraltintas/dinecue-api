@@ -31,6 +31,13 @@ public sealed class EmailProductTests
             Assert.Contains("DineCue", otp.HtmlBody);
             Assert.Contains("DineCue", welcome.HtmlBody);
             Assert.Contains("DineCue", recap.HtmlBody);
+            Assert.DoesNotContain("text-transform", otp.HtmlBody, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("text-transform", welcome.HtmlBody, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("text-transform", recap.HtmlBody, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("<a ", otp.HtmlBody, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("<img", otp.HtmlBody, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("http", otp.HtmlBody, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("123456", otp.TextBody);
         }
     }
 

@@ -2523,14 +2523,14 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
     {
         var locale = NormalizeLocale(model.Locale);
         var minutes = Math.Max(1, model.ExpiresInMinutes ?? 5);
-        var code = WebUtility.HtmlEncode(model.Code ?? "");
+        var code = model.Code?.Trim() ?? "";
         var copy = locale switch
         {
-            "tr" => ("Giriş kodun", $"DineCue'ya devam etmek için kodunu kullan: {code}. Bu kod {minutes} dakika boyunca geçerli.", "Bu isteği sen başlatmadıysan bu e-postayı yok sayabilirsin."),
-            "de" => ("Dein Anmeldecode", $"Nutze diesen Code, um mit DineCue fortzufahren: {code}. Er ist {minutes} Minuten gültig.", "Wenn du das nicht warst, kannst du diese E-Mail einfach ignorieren."),
-            _ => ("Your sign-in code", $"Use this code to continue with DineCue: {code}. It is valid for {minutes} minutes.", "If this was not you, you can ignore this email.")
+            "tr" => ("Giriş kodun", $"DineCue giriş kodun: {code}.", $"Bu kod {minutes} dakika içinde geçerliliğini kaybeder.", "Bu isteği sen başlatmadıysan bu e-postayı yok sayabilirsin."),
+            "de" => ("Dein Anmeldecode", $"Dein DineCue Anmeldecode lautet: {code}.", $"Dieser Code läuft in {minutes} Minuten ab.", "Wenn du das nicht warst, kannst du diese E-Mail einfach ignorieren."),
+            _ => ("Your sign-in code", $"Your DineCue sign-in code is {code}.", $"This code expires in {minutes} minutes.", "If you did not request it, you can ignore this email.")
         };
-        return Layout(locale, copy.Item1, copy.Item2, copy.Item3, highlight: code);
+        return VerificationLayout(locale, copy.Item1, copy.Item2, copy.Item3, copy.Item4, code);
     }
 
     public RenderedEmailTemplate RenderMonthlyRecap(MonthlyRecapEmailModel model)
@@ -2607,6 +2607,32 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
         return (label, url);
     }
 
+    private static RenderedEmailTemplate VerificationLayout(string locale, string subject, string intro, string expiry, string note, string code)
+    {
+        var title = WebUtility.HtmlEncode(subject);
+        var introHtml = WebUtility.HtmlEncode(intro);
+        var expiryHtml = WebUtility.HtmlEncode(expiry);
+        var noteHtml = WebUtility.HtmlEncode(note);
+        var codeHtml = WebUtility.HtmlEncode(code);
+        var html = $$"""
+<!doctype html>
+<html lang="{{locale}}">
+<body style="margin:0;background:#ffffff;font-family:Arial,Helvetica,sans-serif;color:#171717">
+  <div style="max-width:520px;margin:0 auto;padding:28px 20px">
+    <p style="margin:0 0 22px;font-size:15px;line-height:1.4;color:#171717;font-weight:700">DineCue</p>
+    <h1 style="margin:0 0 16px;font-size:22px;line-height:1.3;color:#171717;font-weight:700">{{title}}</h1>
+    <p style="margin:0 0 16px;font-size:16px;line-height:1.55;color:#303030">{{introHtml}}</p>
+    <div style="margin:18px 0;padding:16px 18px;border:1px solid #d9d9d9;border-radius:8px;background:#fafafa;color:#171717;font-size:28px;line-height:1;text-align:center;letter-spacing:6px;font-weight:700;font-family:Arial,Helvetica,sans-serif">{{codeHtml}}</div>
+    <p style="margin:0 0 18px;font-size:14px;line-height:1.55;color:#525252">{{expiryHtml}}</p>
+    <p style="margin:0;font-size:13px;line-height:1.55;color:#707070">{{noteHtml}}</p>
+  </div>
+</body>
+</html>
+""";
+        var text = $"{subject}\n\n{intro}\n\n{expiry}\n\n{note}";
+        return new RenderedEmailTemplate(subject, html, text);
+    }
+
     private static RenderedEmailTemplate Layout(string locale, string subject, string body, string note, (string Label, string Url)? action = null, string? customHtml = null, string? highlight = null)
     {
         var title = WebUtility.HtmlEncode(subject);
@@ -2624,7 +2650,7 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
 <body style="margin:0;background:#19140f;font-family:Inter,Segoe UI,Arial,sans-serif;color:#f6efe6">
   <div style="max-width:620px;margin:0 auto;padding:34px 18px">
     <div style="padding:0 0 18px">
-      <p style="margin:0;color:#f5c56b;font-weight:800;letter-spacing:.12em;text-transform:uppercase;font-size:13px">DineCue</p>
+      <p style="margin:0;color:#f5c56b;font-weight:800;letter-spacing:.08em;font-size:13px">DineCue</p>
     </div>
     <div style="background:#fffaf3;border-radius:18px;padding:34px;border:1px solid #d9b56b;color:#19140f">
       <h1 style="margin:0 0 16px;font-size:26px;line-height:1.25;color:#19140f">{{title}}</h1>
