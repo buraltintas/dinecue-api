@@ -1986,6 +1986,8 @@ internal sealed class OpenAIRecommendationReasoner(
             }
             catch (ProviderFailureException ex)
             {
+                if (string.IsNullOrWhiteSpace(ex.RepairFeedback))
+                    throw;
                 lastError = ex;
                 repairFeedback = ex.RepairFeedback;
             }
@@ -2022,9 +2024,15 @@ internal sealed class OpenAIRecommendationReasoner(
         try
         {
             using var response = await http.SendAsync(request, requestCt);
-            logger.LogInformation("OpenAI recommendation call completed with status {StatusCode}", (int)response.StatusCode);
+            var requestId = response.Headers.TryGetValues("x-request-id", out var requestIds) ? requestIds.FirstOrDefault() : null;
+            var retryAfterSeconds = response.Headers.RetryAfter?.Delta?.TotalSeconds;
+            logger.LogInformation("OpenAI recommendation call completed with status {StatusCode}. RequestId={RequestId}, RetryAfterSeconds={RetryAfterSeconds}", (int)response.StatusCode, requestId, retryAfterSeconds);
             if (!response.IsSuccessStatusCode)
+            {
+                if ((int)response.StatusCode == 429)
+                    throw new ProviderFailureException("reasoning_provider_rate_limited", "We could not complete this recommendation right now.");
                 throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
+            }
 
             await using var stream = await response.Content.ReadAsStreamAsync(requestCt);
             var json = await JsonNode.ParseAsync(stream, cancellationToken: requestCt);
