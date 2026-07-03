@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net;
 using System.Security.Claims;
@@ -2123,9 +2124,9 @@ internal sealed class OpenAIRecommendationReasoner(
         var json = JsonNode.Parse(content) ?? throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
         var recommendations = json["recommendations"]?.AsArray().Select(x => new ReasonedRecommendation(
             DisplayText.CleanInline(x?["placeId"]?.GetValue<string>() ?? "", false),
-            x?["rank"]?.GetValue<int>() ?? 0,
+            ReadInt(x?["rank"], 0),
             DisplayText.CleanInline(x?["label"]?.GetValue<string>() ?? "", false),
-            x?["matchScore"]?.GetValue<int>() ?? -1,
+            ReadInt(x?["matchScore"], -1),
             DisplayText.CleanInline(x?["reason"]?.GetValue<string>() ?? "", true),
             ReadDisplayArray(x?["whyItFits"], true),
             ReadDisplayArray(x?["watchOut"], true),
@@ -2152,6 +2153,41 @@ internal sealed class OpenAIRecommendationReasoner(
             if (!new[] { "low", "medium", "high" }.Contains(rec.Confidence, StringComparer.OrdinalIgnoreCase))
                 throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
         }
+    }
+
+    private static int ReadInt(JsonNode? node, int fallback)
+    {
+        if (node is not JsonValue value)
+            return fallback;
+
+        try
+        {
+            if (value.TryGetValue<int>(out var intValue))
+                return intValue;
+            if (value.TryGetValue<long>(out var longValue) && longValue is >= int.MinValue and <= int.MaxValue)
+                return (int)longValue;
+            if (value.TryGetValue<double>(out var doubleValue) && !double.IsNaN(doubleValue) && !double.IsInfinity(doubleValue))
+                return (int)Math.Round(doubleValue);
+            if (value.TryGetValue<decimal>(out var decimalValue))
+                return (int)Math.Round(decimalValue);
+            if (value.TryGetValue<string>(out var stringValue))
+            {
+                if (int.TryParse(stringValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedInt))
+                    return parsedInt;
+                if (decimal.TryParse(stringValue, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsedDecimal))
+                    return (int)Math.Round(parsedDecimal);
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            return fallback;
+        }
+        catch (FormatException)
+        {
+            return fallback;
+        }
+
+        return fallback;
     }
 
     private static string[] ReadDisplayArray(JsonNode? node, bool ensurePunctuation) =>
