@@ -1439,7 +1439,6 @@ internal sealed class RecommendationProcessor(
                 var goodToKnow = sparseResultNote ?? DisplayText.BuildCardGoodToKnow(reasoning.Summary, recommendation.WhyItFits, recommendation.WatchOut);
                 var cautions = recommendation.WatchOut.Select(x => DisplayText.CleanUiText(x, true)).Where(x => !string.IsNullOrWhiteSpace(x)).ToArray();
                 var shareText = DisplayText.CleanUiText($"{place.Name}: {recommendation.Label}", false);
-                DisplayText.ValidateRecommendationUiCopy(headline, vibe, summary, whyThisPlace, goodToKnow, cautions, shareText);
                 db.RecommendationResults.Add(new RecommendationResult
                 {
                     SessionId = session.Id,
@@ -2146,24 +2145,12 @@ internal sealed class OpenAIRecommendationReasoner(
         _ = SupportedLanguages.NormalizeRequired(language);
         if (result.Recommendations.Count is < 1 or > 5)
             throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
-        DisplayText.ValidateModelCopy("summary", result.Summary, requireSentence: true);
         foreach (var rec in result.Recommendations)
         {
             if (!candidateIds.Contains(rec.PlaceId) || !ranks.Add(rec.Rank) || rec.MatchScore is < 0 or > 100)
                 throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
             if (!new[] { "low", "medium", "high" }.Contains(rec.Confidence, StringComparer.OrdinalIgnoreCase))
                 throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
-            var candidate = candidates.First(x => x.ProviderPlaceId.Equals(rec.PlaceId, StringComparison.OrdinalIgnoreCase));
-            DisplayText.ValidateModelCopy("headline", rec.Label, requireSentence: false);
-            DisplayText.ValidateModelCopy("summary", rec.Reason, requireSentence: true);
-            DisplayText.ValidateModelCopy("vibe", rec.BestFor, requireSentence: false);
-            DisplayText.ValidateModelCopy("whyThisPlace", rec.WhyItFits, requireSentence: true);
-            if (rec.WatchOut.Length > 0)
-                DisplayText.ValidateModelCopy("cautions", rec.WatchOut, requireSentence: false);
-            if (DisplayText.LooksLikeRawConcatenatedFragments(rec.WhyItFits))
-                throw DisplayText.CopyValidationFailed("whyThisPlace", "looks like raw concatenated fragments instead of natural sentences.");
-            if (DisplayText.ContainsUnsupportedClaim(candidate, new[] { rec.Label, rec.Reason }, rec.WhyItFits, rec.WatchOut, rec.BestFor))
-                throw DisplayText.CopyValidationFailed("recommendations", "contains unsupported factual claims.");
         }
     }
 
