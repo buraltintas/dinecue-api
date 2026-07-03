@@ -2201,9 +2201,9 @@ internal static class DisplayText
     private static readonly string[] QuietClaimTerms = ["quiet", "sessiz", "sakin", "ruhig"];
     private static readonly string[] FamilyClaimTerms = ["family-friendly", "child-friendly", "kid-friendly", "aile dostu", "çocuk dostu", "familienfreundlich", "kinderfreundlich"];
     private static readonly string[] ReservationClaimTerms = ["reservation", "reserve", "rezervasyon", "reservierung"];
-    private static readonly string[] OpenClaimTerms = ["open now", "currently open", "şu an açık", "açık", "gerade geöffnet", "jetzt geöffnet"];
+    private static readonly string[] OpenClaimTerms = ["open now", "currently open", "şu an açık", "şimdi açık", "gerade geöffnet", "jetzt geöffnet"];
     private static readonly string[] PhoneClaimTerms = ["phone", "call", "telefon", "arama", "anrufen"];
-    private static readonly string[] ExactMenuClaimTerms = ["sipariş", "order", "bestellen"];
+    private static readonly string[] ExactMenuClaimTerms = ["sipariş edin", "sipariş ver", "şunu sipariş", "order the", "you should order", "must order", "bestellen sie", "solltest du bestellen"];
     public static readonly string[] ForbiddenPhrases =
     [
         "user request",
