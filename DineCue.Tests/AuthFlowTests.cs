@@ -82,6 +82,31 @@ public sealed class AuthFlowTests
         Assert.Equal(1, await db.EmailDeliveryLedgers.CountAsync(x => x.EmailType == "welcome" && x.Status == "sent"));
     }
 
+    /// <summary>
+    /// The welcome email explains the product and asks for preferences, so it is worthless in a language
+    /// the diner does not read. It must follow the language they signed up in, all the way from the request.
+    /// </summary>
+    [Theory]
+    [InlineData("tr", "DineCue'ya hoş geldin")]
+    [InlineData("de", "Willkommen bei DineCue")]
+    [InlineData("en", "Welcome to DineCue")]
+    public async Task WelcomeEmail_UsesTheLanguageTheDinerSignedUpIn(string language, string expectedSubject)
+    {
+        await using var db = CreateDb();
+        var email = new CapturingEmailSender();
+        var service = CreateAuth(db, emailSender: email, environmentName: Environments.Development, exposeDevOtp: true);
+        var start = await service.StartEmailAsync(new EmailStartRequest($"{language}@example.com", language), CancellationToken.None);
+
+        await service.VerifyEmailAsync(new EmailVerifyRequest($"{language}@example.com", start.DevOtp!, language), CancellationToken.None);
+
+        var welcome = email.Messages.Single(x => x.Metadata?["template"] == "welcome");
+        Assert.Equal(expectedSubject, welcome.Subject);
+        Assert.Equal(language, welcome.Locale);
+        // The stored language is what every later email and prompt reads.
+        var user = await db.Users.SingleAsync();
+        Assert.Equal(language, user.PreferredLanguage);
+    }
+
     [Fact]
     public async Task EmailOtpVerify_WrongCodeIncrementsAttempts_AndBlocksAfterLimit()
     {
