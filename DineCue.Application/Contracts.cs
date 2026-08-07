@@ -205,7 +205,10 @@ public sealed record MenuScanResponse(
     DateTimeOffset? CreatedAt = null,
     DateTimeOffset? CompletedAt = null,
     int ImageCount = 0,
-    string? RestaurantPlaceId = null);
+    string? RestaurantPlaceId = null,
+    /// <summary>What the diner typed and selected for this scan. Part of the record, not just our answer.</summary>
+    string? RawText = null,
+    string[]? SelectedCues = null);
 public sealed record MenuScanJob(Guid MenuScanId, Guid UserId);
 
 /// <summary>Everything the menu interpreter needs to read a menu and rank it for one specific diner.</summary>

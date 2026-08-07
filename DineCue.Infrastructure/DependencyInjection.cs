@@ -4285,7 +4285,9 @@ internal sealed class MenuScanService(
             scan.CreatedAt,
             scan.CompletedAt,
             imageCount,
-            scan.RestaurantPlaceId);
+            scan.RestaurantPlaceId,
+            scan.RawTextInput,
+            JsonText.Deserialize(scan.SelectedCuesJson, Array.Empty<string>()));
     }
 
     private static MenuInterpretation EmptyInterpretation(string language) =>
