@@ -20,6 +20,11 @@ public sealed class MenuScanController(IMenuScanService menuScans) : DineCueCont
         return Accepted(accepted.StatusUrl, accepted);
     }
 
+    /// <summary>The diner's past scans, newest first. Without this a finished scan was unreachable.</summary>
+    [HttpGet]
+    public Task<IReadOnlyList<MenuScanListItemDto>> List([FromQuery] int limit = 30, CancellationToken ct = default) =>
+        menuScans.ListAsync(UserId, limit, ct);
+
     [HttpGet("{id:guid}")]
     public Task<MenuScanResponse> Get(Guid id, CancellationToken ct) => menuScans.GetAsync(UserId, id, ct);
 

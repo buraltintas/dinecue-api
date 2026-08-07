@@ -266,6 +266,38 @@ public sealed class RestaurantInsight : Entity
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
+/// <summary>
+/// A fit check a diner ran, stored in full. Distinct from <see cref="RestaurantInsight"/>, which is a
+/// place-level aggregate with no owner: a verdict is personal to whoever asked, and without this the
+/// diner spent a monthly credit on an answer that disappeared when they left the page.
+/// </summary>
+public sealed class RestaurantFitCheck : Entity
+{
+    public Guid UserId { get; set; }
+    public string Provider { get; set; } = "google_places";
+    public string ProviderPlaceId { get; set; } = "";
+    public string PlaceName { get; set; } = "";
+    public string Address { get; set; } = "";
+    public string Language { get; set; } = "en";
+
+    /// <summary>What the diner typed, and the moment they described. Their side of the question.</summary>
+    public string? RawText { get; set; }
+    public string ContextJson { get; set; } = "{}";
+    public DateTimeOffset? VisitAt { get; set; }
+
+    public int FitScore { get; set; }
+    public string Verdict { get; set; } = "";
+    public string Summary { get; set; } = "";
+    public string ProsJson { get; set; } = "[]";
+    public string ConsJson { get; set; } = "[]";
+    public string QuestionsJson { get; set; } = "[]";
+    public double Confidence { get; set; }
+    public string RelevantSignalsJson { get; set; } = "{}";
+    public string ReservationAdvice { get; set; } = "";
+    public string ReservationJson { get; set; } = "{}";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class RestaurantReservationLink : Entity
 {
     public string Provider { get; set; } = "mock";

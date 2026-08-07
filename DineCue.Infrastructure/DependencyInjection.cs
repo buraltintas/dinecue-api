@@ -268,6 +268,7 @@ public static class DependencyInjection
         services.AddScoped<IRestaurantService, RestaurantService>();
         services.AddScoped<IMenuScanService, MenuScanService>();
         services.AddScoped<IInteractionEventService, InteractionEventService>();
+        services.AddScoped<IActivityService, ActivityService>();
         services.AddScoped<IQuotaService, QuotaService>();
         services.AddScoped<IRecommendationStatusNotifier, NoopRecommendationStatusNotifier>();
         services.AddSingleton<IRecommendationJobQueue, InMemoryRecommendationJobQueue>();
@@ -3448,9 +3449,10 @@ internal sealed class RestaurantService(
                 dining == null ? null : ProfileMapping.ToDto(dining),
                 ReadVisitAt(request.Context));
             var response = await fit.AnalyzeAsync(context, ct);
-            await PersistInsightAsync(placeId, language, response, ct);
+            // Stored before returning, so a spent credit is always reviewable afterwards.
+            var stored = await PersistFitCheckAsync(userId, place, request, context.VisitAt, language, response, ct);
             await events.TrackAsync(userId, new InteractionEventRequest("RestaurantFitChecked", "Restaurant", placeId, new Dictionary<string, object> { ["fitScore"] = response.FitScore }), ct);
-            return response;
+            return ToFitCheckResponse(stored, response.RelevantSignals, response.Reservation);
         }
         catch
         {
@@ -3459,22 +3461,82 @@ internal sealed class RestaurantService(
         }
     }
 
-    /// <summary>
-    /// Keeps the fit narrative for later aggregate signals. It is never served from here: the verdict is
-    /// personal to the diner who asked, so replaying another person's answer would be wrong.
-    /// </summary>
-    private async Task PersistInsightAsync(string placeId, string language, RestaurantFitCheckResponse response, CancellationToken ct)
+    public async Task<RestaurantFitCheckResponse> GetFitCheckAsync(Guid userId, Guid fitCheckId, CancellationToken ct)
     {
+        var stored = await db.RestaurantFitChecks.AsNoTracking().FirstOrDefaultAsync(x => x.Id == fitCheckId && x.UserId == userId, ct)
+            ?? throw new ApiException("not_found", "This fit check was not found.", 404);
+        return ToFitCheckResponse(
+            stored,
+            JsonText.Deserialize(stored.RelevantSignalsJson, new Dictionary<string, object>()),
+            Mapping.ReservationFromJson(stored.ReservationJson));
+    }
+
+    /// <summary>
+    /// Stores the diner's own copy of the verdict, and separately keeps a place-level insight row for later
+    /// aggregate signals. The insight row is never served back: a verdict is personal to whoever asked, so
+    /// replaying someone else's answer would be wrong.
+    /// </summary>
+    private async Task<RestaurantFitCheck> PersistFitCheckAsync(
+        Guid userId,
+        PlaceCandidate place,
+        RestaurantFitCheckRequest request,
+        DateTimeOffset? visitAt,
+        string language,
+        RestaurantFitCheckResponse response,
+        CancellationToken ct)
+    {
+        var stored = new RestaurantFitCheck
+        {
+            UserId = userId,
+            Provider = place.Provider,
+            ProviderPlaceId = place.ProviderPlaceId,
+            PlaceName = place.Name,
+            Address = place.Address,
+            Language = language,
+            RawText = string.IsNullOrWhiteSpace(request.RawText) ? null : request.RawText,
+            ContextJson = JsonText.Serialize(request.Context ?? new Dictionary<string, object>()),
+            VisitAt = visitAt,
+            FitScore = response.FitScore,
+            Verdict = response.Verdict,
+            Summary = response.Summary,
+            ProsJson = JsonText.Serialize(response.Pros),
+            ConsJson = JsonText.Serialize(response.Cons),
+            QuestionsJson = JsonText.Serialize(response.QuestionsToAsk),
+            Confidence = response.Confidence,
+            RelevantSignalsJson = JsonText.Serialize(response.RelevantSignals),
+            ReservationAdvice = response.ReservationAdvice,
+            ReservationJson = JsonText.Serialize(response.Reservation)
+        };
+        db.RestaurantFitChecks.Add(stored);
         db.RestaurantInsights.Add(new RestaurantInsight
         {
-            ProviderPlaceId = placeId,
+            ProviderPlaceId = place.ProviderPlaceId,
             Language = language,
             Summary = response.Summary,
             ProsJson = JsonText.Serialize(response.Pros),
             ConsJson = JsonText.Serialize(response.Cons)
         });
         await db.SaveChangesAsync(ct);
+        return stored;
     }
+
+    internal static RestaurantFitCheckResponse ToFitCheckResponse(RestaurantFitCheck stored, Dictionary<string, object> signals, ReservationDto reservation) =>
+        new(stored.FitScore,
+            stored.Verdict,
+            stored.Summary,
+            JsonText.Deserialize(stored.ProsJson, Array.Empty<string>()),
+            JsonText.Deserialize(stored.ConsJson, Array.Empty<string>()),
+            JsonText.Deserialize(stored.QuestionsJson, Array.Empty<string>()),
+            stored.Confidence,
+            signals,
+            stored.ReservationAdvice,
+            reservation,
+            stored.Id,
+            stored.ProviderPlaceId,
+            stored.PlaceName,
+            stored.Address,
+            stored.RawText,
+            stored.CreatedAt);
 
     /// <summary>Reads an optional ISO-8601 intended visit time out of the free-form context bag.</summary>
     internal static DateTimeOffset? ReadVisitAt(Dictionary<string, object>? context)
@@ -4046,6 +4108,42 @@ internal sealed class MenuScanService(
         return ToResponse(scan, imageCount);
     }
 
+    public async Task<IReadOnlyList<MenuScanListItemDto>> ListAsync(Guid userId, int limit, CancellationToken ct)
+    {
+        var take = Math.Clamp(limit, 1, 100);
+        var scans = await db.MenuScans.AsNoTracking()
+            .Where(x => x.UserId == userId)
+            .OrderByDescending(x => x.CreatedAt)
+            .Take(take)
+            .Select(x => new
+            {
+                Scan = x,
+                ImageCount = db.MenuScanImages.Count(i => i.MenuScanId == x.Id),
+                ItemCount = db.MenuScanItems.Count(i => i.MenuScanId == x.Id),
+                Suggestions = db.MenuScanRecommendations.Where(r => r.MenuScanId == x.Id).Select(r => r.ItemName).Take(3).ToList()
+            })
+            .ToListAsync(ct);
+
+        return scans.Select(row =>
+        {
+            // The stored interpretation holds the summary; only the counts need separate queries.
+            var interpretation = JsonText.Deserialize(row.Scan.RawAiResponseJson, EmptyInterpretation(row.Scan.Language));
+            return new MenuScanListItemDto(
+                row.Scan.Id,
+                row.Scan.Status,
+                row.Scan.Language,
+                row.Scan.RawTextInput,
+                row.Scan.RestaurantPlaceId,
+                interpretation.Summary,
+                row.ImageCount,
+                row.ItemCount,
+                row.Suggestions.ToArray(),
+                row.Scan.ErrorCode,
+                row.Scan.CreatedAt,
+                row.Scan.CompletedAt);
+        }).ToList();
+    }
+
     public async Task<MenuScanResponse> RecommendAsync(Guid userId, Guid id, CancellationToken ct)
     {
         var scan = await db.MenuScans.FirstOrDefaultAsync(x => x.Id == id && x.UserId == userId, ct)
@@ -4192,6 +4290,119 @@ internal sealed class MenuScanService(
 
     private static MenuInterpretation EmptyInterpretation(string language) =>
         new(language, "", [], [], [], [], []);
+}
+
+/// <summary>
+/// The diner's record of every credit-spending action. One monthly credit buys exactly one entry, so this
+/// is the honest answer to "what did I spend my decisions on", and it is the only way a completed menu scan
+/// or fit check stays reachable after the diner navigates away.
+/// </summary>
+internal sealed class ActivityService(DineCueDbContext db) : IActivityService
+{
+    public async Task<IReadOnlyList<ActivityItemDto>> ListAsync(Guid userId, string? kind, int limit, CancellationToken ct)
+    {
+        var take = Math.Clamp(limit, 1, 100);
+        var normalizedKind = string.IsNullOrWhiteSpace(kind) ? null : kind.Trim().ToLowerInvariant();
+        if (normalizedKind is not null and not ActivityKinds.Recommendation and not ActivityKinds.MenuScan and not ActivityKinds.FitCheck)
+            throw new ApiException("validation_error", "kind must be one of recommendation, menu_scan, fit_check.", 400, new { field = "kind" });
+
+        var items = new List<ActivityItemDto>();
+        if (normalizedKind is null or ActivityKinds.Recommendation) items.AddRange(await RecommendationsAsync(userId, take, ct));
+        if (normalizedKind is null or ActivityKinds.MenuScan) items.AddRange(await MenuScansAsync(userId, take, ct));
+        if (normalizedKind is null or ActivityKinds.FitCheck) items.AddRange(await FitChecksAsync(userId, take, ct));
+
+        // Each source is queried for a full page, then the merge is trimmed, so the newest entries win
+        // regardless of which flow produced them.
+        return items.OrderByDescending(x => x.CreatedAt).Take(take).ToList();
+    }
+
+    private async Task<List<ActivityItemDto>> RecommendationsAsync(Guid userId, int take, CancellationToken ct)
+    {
+        var sessions = await db.RecommendationSessions.AsNoTracking()
+            .Where(x => x.UserId == userId)
+            .OrderByDescending(x => x.CreatedAt)
+            .Take(take)
+            .Select(x => new { x.Id, x.RawText, x.Status, x.LocationText, x.LocationMode, x.ErrorCode, x.CreatedAt })
+            .ToListAsync(ct);
+        var ids = sessions.Select(x => x.Id).ToArray();
+        // The place names are what make a past session recognisable at a glance.
+        var names = await (from result in db.RecommendationResults.AsNoTracking()
+                           join candidate in db.RecommendationCandidates.AsNoTracking() on result.CandidateId equals candidate.Id
+                           where ids.Contains(result.SessionId)
+                           orderby result.Rank
+                           select new { result.SessionId, candidate.Name })
+            .ToListAsync(ct);
+
+        return sessions.Select(session => new ActivityItemDto(
+            ActivityKinds.Recommendation,
+            session.Id,
+            session.Status,
+            session.RawText,
+            string.IsNullOrWhiteSpace(session.LocationText) ? session.LocationMode : session.LocationText,
+            names.Where(x => x.SessionId == session.Id).Select(x => x.Name).Take(3).ToArray(),
+            null,
+            0,
+            session.ErrorCode,
+            session.CreatedAt)).ToList();
+    }
+
+    private async Task<List<ActivityItemDto>> MenuScansAsync(Guid userId, int take, CancellationToken ct)
+    {
+        var scans = await db.MenuScans.AsNoTracking()
+            .Where(x => x.UserId == userId)
+            .OrderByDescending(x => x.CreatedAt)
+            .Take(take)
+            .Select(x => new
+            {
+                x.Id,
+                x.Status,
+                x.RawTextInput,
+                x.RestaurantPlaceId,
+                x.ErrorCode,
+                x.CreatedAt,
+                ImageCount = db.MenuScanImages.Count(i => i.MenuScanId == x.Id),
+                Suggestions = db.MenuScanRecommendations.Where(r => r.MenuScanId == x.Id).Select(r => r.ItemName).Take(3).ToList()
+            })
+            .ToListAsync(ct);
+
+        return scans.Select(scan => new ActivityItemDto(
+            ActivityKinds.MenuScan,
+            scan.Id,
+            scan.Status,
+            // A scan often has no typed note, so the suggestions carry the identity instead.
+            string.IsNullOrWhiteSpace(scan.RawTextInput)
+                ? (scan.Suggestions.Count > 0 ? string.Join(", ", scan.Suggestions) : "")
+                : scan.RawTextInput!,
+            scan.RestaurantPlaceId,
+            scan.Suggestions.ToArray(),
+            null,
+            scan.ImageCount,
+            scan.ErrorCode,
+            scan.CreatedAt)).ToList();
+    }
+
+    private async Task<List<ActivityItemDto>> FitChecksAsync(Guid userId, int take, CancellationToken ct)
+    {
+        var checks = await db.RestaurantFitChecks.AsNoTracking()
+            .Where(x => x.UserId == userId)
+            .OrderByDescending(x => x.CreatedAt)
+            .Take(take)
+            .Select(x => new { x.Id, x.PlaceName, x.Address, x.Verdict, x.FitScore, x.RawText, x.CreatedAt })
+            .ToListAsync(ct);
+
+        return checks.Select(check => new ActivityItemDto(
+            ActivityKinds.FitCheck,
+            check.Id,
+            // A stored check is by definition a finished one; the flow is synchronous.
+            "completed",
+            check.PlaceName,
+            string.IsNullOrWhiteSpace(check.RawText) ? check.Address : check.RawText,
+            string.IsNullOrWhiteSpace(check.Verdict) ? [] : [check.Verdict],
+            check.FitScore,
+            0,
+            null,
+            check.CreatedAt)).ToList();
+    }
 }
 
 internal sealed class InteractionEventService(DineCueDbContext db) : IInteractionEventService

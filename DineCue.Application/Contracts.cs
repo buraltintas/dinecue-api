@@ -110,7 +110,65 @@ public sealed record RestaurantSearchRequest(string Query, LocationInput? Locati
 public sealed record RestaurantSearchResultDto(string Provider, string ProviderPlaceId, string Name, string Address, double Latitude, double Longitude, decimal? Rating, int? RatingCount, int? PriceLevel, ReservationDto Reservation);
 public sealed record RestaurantDetailsDto(string Provider, string ProviderPlaceId, string Name, string Address, double Latitude, double Longitude, decimal? Rating, int? RatingCount, int? PriceLevel, string? WebsiteUrl, string? GoogleMapsUri, string? PhoneNumber, ReservationDto Reservation);
 public sealed record RestaurantFitCheckRequest(string? RawText, string? Language, Dictionary<string, object>? Context);
-public sealed record RestaurantFitCheckResponse(int FitScore, string Verdict, string Summary, string[] Pros, string[] Cons, string[] QuestionsToAsk, double Confidence, Dictionary<string, object> RelevantSignals, string ReservationAdvice, ReservationDto Reservation);
+
+/// <summary>
+/// <paramref name="Id"/> and the place fields let a diner return to a check later. They are appended, so
+/// the existing field names and types are untouched.
+/// </summary>
+public sealed record RestaurantFitCheckResponse(
+    int FitScore,
+    string Verdict,
+    string Summary,
+    string[] Pros,
+    string[] Cons,
+    string[] QuestionsToAsk,
+    double Confidence,
+    Dictionary<string, object> RelevantSignals,
+    string ReservationAdvice,
+    ReservationDto Reservation,
+    Guid Id = default,
+    string ProviderPlaceId = "",
+    string PlaceName = "",
+    string Address = "",
+    string? RawText = null,
+    DateTimeOffset? CreatedAt = null);
+
+public sealed record MenuScanListItemDto(
+    Guid MenuScanId,
+    string Status,
+    string Language,
+    string? RawText,
+    string? RestaurantPlaceId,
+    string Summary,
+    int ImageCount,
+    int ItemCount,
+    string[] SuggestedItems,
+    string? ErrorCode,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? CompletedAt);
+
+/// <summary>
+/// One entry in the diner's history, whichever flow produced it. A monthly credit buys exactly one of
+/// these, so the feed is the honest record of what they spent it on.
+/// </summary>
+public sealed record ActivityItemDto(
+    string Kind,
+    Guid Id,
+    string Status,
+    string Title,
+    string? Subtitle,
+    string[] Highlights,
+    int? Score,
+    int ImageCount,
+    string? ErrorCode,
+    DateTimeOffset CreatedAt);
+
+public static class ActivityKinds
+{
+    public const string Recommendation = "recommendation";
+    public const string MenuScan = "menu_scan";
+    public const string FitCheck = "fit_check";
+}
 
 /// <summary>
 /// A menu scan request. Images are uploaded first through POST /uploads/menu-images (which costs no credits)
@@ -387,12 +445,27 @@ public interface IRestaurantService
     Task<IReadOnlyList<RestaurantSearchResultDto>> SearchAsync(RestaurantSearchRequest request, CancellationToken cancellationToken);
     Task<RestaurantDetailsDto> GetAsync(string placeId, CancellationToken cancellationToken);
     Task<RestaurantFitCheckResponse> FitCheckAsync(Guid userId, string placeId, RestaurantFitCheckRequest request, CancellationToken cancellationToken);
+
+    /// <summary>Returns a fit check the diner ran earlier, so a spent credit stays reviewable.</summary>
+    Task<RestaurantFitCheckResponse> GetFitCheckAsync(Guid userId, Guid fitCheckId, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// The diner's own record of every credit-spending action, merged chronologically across the three flows.
+/// </summary>
+public interface IActivityService
+{
+    /// <summary><paramref name="kind"/> is null for the merged feed, or one of <see cref="ActivityKinds"/> to group.</summary>
+    Task<IReadOnlyList<ActivityItemDto>> ListAsync(Guid userId, string? kind, int limit, CancellationToken cancellationToken);
 }
 
 public interface IMenuScanService
 {
     Task<MenuScanAcceptedResponse> CreateAsync(Guid userId, MenuScanRequest request, CancellationToken cancellationToken);
     Task<MenuScanResponse> GetAsync(Guid userId, Guid id, CancellationToken cancellationToken);
+
+    /// <summary>The diner's past scans. Without this a completed scan was unreachable once they navigated away.</summary>
+    Task<IReadOnlyList<MenuScanListItemDto>> ListAsync(Guid userId, int limit, CancellationToken cancellationToken);
 
     /// <summary>Re-ranks an existing scan against the diner's current profile. Costs no credits: no image is read again.</summary>
     Task<MenuScanResponse> RecommendAsync(Guid userId, Guid id, CancellationToken cancellationToken);

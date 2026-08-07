@@ -24,6 +24,7 @@ public sealed class DineCueDbContext(DbContextOptions<DineCueDbContext> options)
     public DbSet<RestaurantSnapshot> RestaurantSnapshots => Set<RestaurantSnapshot>();
     public DbSet<RestaurantInsight> RestaurantInsights => Set<RestaurantInsight>();
     public DbSet<RestaurantReservationLink> RestaurantReservationLinks => Set<RestaurantReservationLink>();
+    public DbSet<RestaurantFitCheck> RestaurantFitChecks => Set<RestaurantFitCheck>();
     public DbSet<MenuScan> MenuScans => Set<MenuScan>();
     public DbSet<MenuScanItem> MenuScanItems => Set<MenuScanItem>();
     public DbSet<MenuScanRecommendation> MenuScanRecommendations => Set<MenuScanRecommendation>();
@@ -167,6 +168,14 @@ public sealed class DineCueDbContext(DbContextOptions<DineCueDbContext> options)
         {
             e.ToTable("restaurant_reservation_links");
             e.HasIndex(x => new { x.Provider, x.ProviderPlaceId });
+        });
+
+        b.Entity<RestaurantFitCheck>(e =>
+        {
+            e.ToTable("restaurant_fit_checks");
+            // The history feed reads a diner's checks newest first.
+            e.HasIndex(x => new { x.UserId, x.CreatedAt });
+            e.HasOne<User>().WithMany().HasForeignKey(x => x.UserId);
         });
 
         b.Entity<MenuScan>(e =>
