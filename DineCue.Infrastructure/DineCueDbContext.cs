@@ -27,6 +27,7 @@ public sealed class DineCueDbContext(DbContextOptions<DineCueDbContext> options)
     public DbSet<MenuScan> MenuScans => Set<MenuScan>();
     public DbSet<MenuScanItem> MenuScanItems => Set<MenuScanItem>();
     public DbSet<MenuScanRecommendation> MenuScanRecommendations => Set<MenuScanRecommendation>();
+    public DbSet<MenuScanImage> MenuScanImages => Set<MenuScanImage>();
     public DbSet<SavedPlace> SavedPlaces => Set<SavedPlace>();
     public DbSet<RecommendationFeedback> RecommendationFeedback => Set<RecommendationFeedback>();
     public DbSet<InteractionEvent> InteractionEvents => Set<InteractionEvent>();
@@ -171,13 +172,23 @@ public sealed class DineCueDbContext(DbContextOptions<DineCueDbContext> options)
         b.Entity<MenuScan>(e =>
         {
             e.ToTable("menu_scans");
+            e.HasIndex(x => new { x.UserId, x.Status });
             e.HasOne<User>().WithMany().HasForeignKey(x => x.UserId);
             e.HasMany(x => x.Items).WithOne().HasForeignKey(x => x.MenuScanId);
             e.HasMany(x => x.Recommendations).WithOne().HasForeignKey(x => x.MenuScanId);
+            e.HasMany(x => x.Images).WithOne().HasForeignKey(x => x.MenuScanId);
         });
 
         b.Entity<MenuScanItem>().ToTable("menu_scan_items");
         b.Entity<MenuScanRecommendation>().ToTable("menu_scan_recommendations");
+
+        b.Entity<MenuScanImage>(e =>
+        {
+            e.ToTable("menu_scan_images");
+            e.HasIndex(x => x.ObjectName).IsUnique();
+            e.HasIndex(x => new { x.UserId, x.MenuScanId });
+            e.HasOne<User>().WithMany().HasForeignKey(x => x.UserId);
+        });
 
         b.Entity<SavedPlace>(e =>
         {

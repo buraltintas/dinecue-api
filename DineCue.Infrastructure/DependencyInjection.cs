@@ -98,18 +98,82 @@ public sealed class GooglePlacesOptions
     public int MaxCandidates { get; set; } = 24;
     public int DefaultRadiusMeters { get; set; } = 2500;
     public int RequestTimeoutSeconds { get; set; } = 12;
+
+    /// <summary>How long a cached <see cref="Domain.RestaurantSnapshot"/> is reused instead of calling Places again.</summary>
+    public int SnapshotFreshnessHours { get; set; } = 168;
+
+    /// <summary>In-process cache lifetime for text-search result pools, so refining a session does not pay twice.</summary>
+    public int SearchCacheMinutes { get; set; } = 15;
+
+    /// <summary>In-process cache lifetime for resolved free-text locations.</summary>
+    public int GeocodeCacheHours { get; set; } = 24;
 }
 
 public sealed class OpenAIOptions
 {
     public string ApiKey { get; set; } = "";
     public string Model { get; set; } = "";
+
+    /// <summary>Optional override for image-reading calls. Falls back to <see cref="Model"/> when blank.</summary>
+    public string VisionModel { get; set; } = "";
     public int RequestTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Uses strict json_schema response formatting instead of plain json_object. Kept configurable so the
+    /// stricter mode can be switched off without a redeploy if a model version misbehaves.
+    /// </summary>
+    public bool UseStructuredOutputs { get; set; } = true;
+
+    /// <summary>Transport-level retries for network faults, 429s, and 5xx responses.</summary>
+    public int MaxTransportAttempts { get; set; } = 3;
+
+    public string EffectiveVisionModel() => string.IsNullOrWhiteSpace(VisionModel) ? Model : VisionModel.Trim();
 }
 
 public sealed class RecommendationOptions
 {
     public bool UseMockProvider { get; set; }
+}
+
+public sealed class StorageOptions
+{
+    /// <summary>
+    /// When false the app uses in-process storage and mock menu interpretation, so menu scanning degrades
+    /// safely and the recommendation flow is untouched. This is the staged-rollout switch.
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>Private GCS bucket. Access comes from the Cloud Run service account (ADC), not from a secret.</summary>
+    public string Bucket { get; set; } = "";
+    public string ObjectPrefix { get; set; } = "menu-scans";
+    public long MaxImageBytes { get; set; } = 8 * 1024 * 1024;
+    public int MaxImagesPerScan { get; set; } = 3;
+
+    /// <summary>
+    /// Overrides the accepted image formats. Left empty by default because configuration binding *appends* to
+    /// a pre-populated array instead of replacing it, which would make narrowing the list silently impossible.
+    /// Resolve it through <see cref="EffectiveAllowedContentTypes"/>, never directly.
+    /// </summary>
+    public string[] AllowedContentTypes { get; set; } = [];
+
+    /// <summary>How long an uploaded image may stay unattached to a scan before it is swept.</summary>
+    public int OrphanImageRetentionHours { get; set; } = 24;
+
+    public int EffectiveMaxImagesPerScan() => Math.Clamp(MaxImagesPerScan, 1, 6);
+    public long EffectiveMaxImageBytes() => Math.Clamp(MaxImageBytes, 64 * 1024, 20 * 1024 * 1024);
+
+    /// <summary>Defaults to the formats the vision model can actually read; HEIC is deliberately excluded.</summary>
+    public string[] EffectiveAllowedContentTypes()
+    {
+        var configured = (AllowedContentTypes ?? [])
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim().ToLowerInvariant())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        return configured.Length > 0
+            ? configured
+            : [ImageContentType.Jpeg, ImageContentType.Png, ImageContentType.WebP];
+    }
 }
 
 public sealed class QuotasOptions
@@ -139,6 +203,7 @@ public static class DependencyInjection
         services.Configure<OpenAIOptions>(configuration.GetSection("OpenAI"));
         services.Configure<RecommendationOptions>(configuration.GetSection("Recommendation"));
         services.Configure<QuotasOptions>(configuration.GetSection("Quotas"));
+        services.Configure<StorageOptions>(configuration.GetSection("Storage"));
 
         var jwt = configuration.GetSection("Jwt").Get<JwtOptions>() ?? throw new InvalidOperationException("Jwt settings are required.");
         if (string.IsNullOrWhiteSpace(configuration["Jwt:Issuer"]) || string.IsNullOrWhiteSpace(configuration["Jwt:Audience"]))
@@ -155,6 +220,11 @@ public static class DependencyInjection
             if (string.IsNullOrWhiteSpace(configuration["OpenAI:Model"]))
                 throw new InvalidOperationException("OpenAI provider is not configured. Set OpenAI:Model.");
         }
+        // Menu scanning is gated separately so it can be rolled out without touching the recommendation flow.
+        var storageOptions = configuration.GetSection("Storage").Get<StorageOptions>() ?? new StorageOptions();
+        var storageEnabled = storageOptions.Enabled;
+        if (storageEnabled && string.IsNullOrWhiteSpace(storageOptions.Bucket))
+            throw new InvalidOperationException("Storage:Bucket must be configured when Storage:Enabled is true.");
         services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             .AddJwtBearer(options =>
             {
@@ -199,10 +269,23 @@ public static class DependencyInjection
         services.AddScoped<IRecommendationStatusNotifier, NoopRecommendationStatusNotifier>();
         services.AddSingleton<IRecommendationJobQueue, InMemoryRecommendationJobQueue>();
         services.AddHostedService<RecommendationProcessingWorker>();
+        services.AddScoped<MenuScanProcessor>();
+        services.AddSingleton<IMenuScanJobQueue, InMemoryMenuScanJobQueue>();
+        services.AddHostedService<MenuScanProcessingWorker>();
+        if (storageEnabled)
+            services.AddSingleton<IObjectStorage, GcsObjectStorage>();
+        else
+            services.AddSingleton<IObjectStorage, InMemoryObjectStorage>();
+        services.AddSingleton<IRestaurantSnapshotStore, RestaurantSnapshotStore>();
         if (useMockRecommendationProvider)
         {
             services.AddSingleton<IPlaceSearchProvider, MockRecommendationPlaceSearchProvider>();
             services.AddSingleton<IRecommendationReasoner, MockRecommendationReasoner>();
+            services.AddSingleton<IPlacesProvider, MockPlacesProvider>();
+            services.AddSingleton<ILocationResolver, MockLocationResolver>();
+            services.AddSingleton<IReservationLinkResolver, MockReservationLinkResolver>();
+            services.AddSingleton<IAiMenuInterpreter, MockAiMenuInterpreter>();
+            services.AddSingleton<IAiRestaurantFitAnalyzer, MockAiRestaurantFitAnalyzer>();
         }
         else
         {
@@ -211,13 +294,29 @@ public static class DependencyInjection
                 var providerOptions = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<GooglePlacesOptions>>().Value;
                 client.Timeout = TimeSpan.FromSeconds(Math.Clamp(providerOptions.RequestTimeoutSeconds, 1, 60));
             });
-            services.AddHttpClient<OpenAIRecommendationReasoner>((sp, client) =>
+            services.AddHttpClient<GooglePlacesRestaurantProvider>((sp, client) =>
+            {
+                var providerOptions = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<GooglePlacesOptions>>().Value;
+                client.Timeout = TimeSpan.FromSeconds(Math.Clamp(providerOptions.RequestTimeoutSeconds, 1, 60));
+            });
+            services.AddHttpClient<GoogleLocationResolver>((sp, client) =>
+            {
+                var providerOptions = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<GooglePlacesOptions>>().Value;
+                client.Timeout = TimeSpan.FromSeconds(Math.Clamp(providerOptions.RequestTimeoutSeconds, 1, 60));
+            });
+            services.AddHttpClient<OpenAiJsonClient>((sp, client) =>
             {
                 var providerOptions = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<OpenAIOptions>>().Value;
-                client.Timeout = TimeSpan.FromSeconds(Math.Clamp(providerOptions.RequestTimeoutSeconds, 1, 120));
+                // Generous per-request headroom; the shared client applies the real budget with its own token.
+                client.Timeout = TimeSpan.FromSeconds(Math.Clamp(providerOptions.RequestTimeoutSeconds, 1, 120) + 15);
             });
             services.AddScoped<IPlaceSearchProvider>(sp => sp.GetRequiredService<GooglePlacesProvider>());
-            services.AddScoped<IRecommendationReasoner>(sp => sp.GetRequiredService<OpenAIRecommendationReasoner>());
+            services.AddScoped<IRecommendationReasoner, OpenAIRecommendationReasoner>();
+            services.AddScoped<IPlacesProvider>(sp => sp.GetRequiredService<GooglePlacesRestaurantProvider>());
+            services.AddScoped<ILocationResolver>(sp => sp.GetRequiredService<GoogleLocationResolver>());
+            services.AddSingleton<IReservationLinkResolver, PlacesReservationLinkResolver>();
+            services.AddScoped<IAiMenuInterpreter, OpenAiMenuInterpreter>();
+            services.AddScoped<IAiRestaurantFitAnalyzer, OpenAiRestaurantFitAnalyzer>();
         }
         services.AddScoped<ISubscriptionProvider, MockSubscriptionProvider>();
         services.AddScoped<OtpRateLimiter>();
@@ -254,16 +353,12 @@ public static class DependencyInjection
             services.AddSingleton<IGoogleAuthValidator>(_ => new MockGoogleAuthValidator(environment));
         }
         services.AddSingleton<ITokenService, TokenService>();
-        services.AddSingleton<IPlacesProvider, MockPlacesProvider>();
-        services.AddSingleton<ILocationResolver, MockLocationResolver>();
+        // Produces real Google Maps URLs, so it is not environment dependent.
+        services.AddSingleton<IRouteProvider, GoogleMapsRouteProvider>();
+        // Weather and heuristic intent parsing are still local-only signals; they never claim provider facts.
         services.AddSingleton<IWeatherProvider, MockWeatherProvider>();
-        services.AddSingleton<IRouteProvider, MockRouteProvider>();
-        services.AddSingleton<IMenuOcrProvider, MockMenuOcrProvider>();
         services.AddSingleton<IAiIntentParser, MockAiIntentParser>();
         services.AddSingleton<IAiPlaceRanker, MockAiPlaceRanker>();
-        services.AddSingleton<IAiRestaurantFitAnalyzer, MockAiRestaurantFitAnalyzer>();
-        services.AddSingleton<IAiMenuInterpreter, MockAiMenuInterpreter>();
-        services.AddSingleton<IReservationLinkResolver, MockReservationLinkResolver>();
         return services;
     }
 
@@ -299,6 +394,7 @@ internal static class Mapping
         result.Headline,
         candidate.Name,
         candidate.Address,
+        candidate.ProviderPlaceId,
         result.Vibe,
         result.Summary,
         result.WhyThisPlace,
@@ -309,6 +405,39 @@ internal static class Mapping
         ReservationFromJson(result.ReservationJson),
         result.RouteUrl,
         result.ShareText);
+}
+
+/// <summary>
+/// Shared entity-to-DTO mapping for the stored profiles. These carry the diner's durable context
+/// (allergies, dietary restrictions, spice tolerance, kids, budget) into every AI flow, so recommendation,
+/// menu scanning, and fit check all personalize from the same source and stay consistent.
+/// </summary>
+internal static class ProfileMapping
+{
+    public static ProfileDto ToDto(UserProfile profile) =>
+        new(profile.DisplayName, profile.PreferredLanguage, profile.Country, profile.Currency, profile.DistanceUnit);
+
+    public static TasteProfileDto ToDto(TasteProfile taste) => new(
+        JsonText.Deserialize(taste.FavoriteCuisinesJson, Array.Empty<string>()),
+        JsonText.Deserialize(taste.DislikedCuisinesJson, Array.Empty<string>()),
+        JsonText.Deserialize(taste.FavoriteDishesJson, Array.Empty<string>()),
+        JsonText.Deserialize(taste.DislikedIngredientsJson, Array.Empty<string>()),
+        taste.SpiceTolerance,
+        taste.SweetSaltyPreference,
+        JsonText.Deserialize(taste.DrinkPreferencesJson, Array.Empty<string>()),
+        JsonText.Deserialize(taste.DietaryRestrictionsJson, Array.Empty<string>()),
+        JsonText.Deserialize(taste.AllergiesJson, Array.Empty<string>()));
+
+    public static DiningProfileDto ToDto(DiningProfile dining) => new(
+        dining.UsuallyWithKids,
+        dining.PrefersQuietPlaces,
+        dining.PrefersOutdoor,
+        dining.BudgetSensitivity,
+        dining.LikesLocalExperiences,
+        dining.LikesPremiumPlaces,
+        dining.NeedsParking,
+        dining.NeedsAccessibility,
+        dining.DefaultDistanceMeters);
 }
 
 internal static class SupportedLanguages
@@ -416,6 +545,7 @@ internal static partial class RequestValidation
         Text(request.Query, "query", 1, 200);
         Language(request.Language);
         Location(request.Location);
+        ArrayLimit(request.Cues, "cues", 4, 40);
     }
 
     public static void RestaurantFit(RestaurantFitCheckRequest request)
@@ -425,16 +555,24 @@ internal static partial class RequestValidation
         Language(request.Language);
     }
 
-    public static void MenuScan(MenuScanRequest request)
+    public static void MenuScan(MenuScanRequest request, int maxImages)
     {
         if (request == null) throw Invalid("Request body is required.", new { field = "body" });
-        Text(request.ImageUrl, "imageUrl", 0, 2048);
-        Text(request.ImageBase64, "imageBase64", 0, 250_000);
+        // imageUrl is no longer an accepted image source: fetching an arbitrary caller-supplied URL is an
+        // unnecessary risk now that uploads go through POST /uploads/menu-images.
+        if (!string.IsNullOrWhiteSpace(request.ImageUrl))
+            throw Invalid("imageUrl is no longer supported. Upload the photo first and send imageObjectNames.", new { field = "imageUrl" });
+        Text(request.ImageBase64, "imageBase64", 0, 12_000_000);
         Text(request.OcrText, "ocrText", 0, 20_000);
         Text(request.RestaurantPlaceId, "restaurantPlaceId", 0, 200);
+        Text(request.RawText, "rawText", 0, 800);
         Language(request.Language);
-        if (string.IsNullOrWhiteSpace(request.OcrText) && string.IsNullOrWhiteSpace(request.ImageUrl) && string.IsNullOrWhiteSpace(request.ImageBase64))
-            throw Invalid("Provide ocrText, imageUrl, or imageBase64.", new { field = "ocrText" });
+        ArrayLimit(request.SelectedCues, "selectedCues", 12, 40);
+        ArrayLimit(request.ImageObjectNames, "imageObjectNames", maxImages, 512);
+        if ((request.ImageObjectNames ?? []).Length == 0
+            && string.IsNullOrWhiteSpace(request.OcrText)
+            && string.IsNullOrWhiteSpace(request.ImageBase64))
+            throw Invalid("Provide imageObjectNames, ocrText, or imageBase64.", new { field = "imageObjectNames" });
     }
 
     public static void Feedback(FeedbackRequest request)
@@ -1382,20 +1520,24 @@ internal sealed class RecommendationProcessor(
 
             await SetStepAsync(session, "searching_places", ct);
             var location = await locations.ResolveAsync(originalLocation, ct);
-            foreach (var assumption in location.Assumptions) intent.Assumptions.TryAdd(assumption.Key, assumption.Value);
-            NormalizeLocationAssumptions(intent.Assumptions, locationConfidence, recommendationOptions.Value.UseMockProvider);
+            // The resolver knows more about the outcome than the request shape did, so its assumptions win.
+            var resolvedConfidence = location.Assumptions.TryGetValue("locationConfidence", out var resolverConfidence) && resolverConfidence is string { Length: > 0 } text
+                ? text
+                : locationConfidence;
+            foreach (var assumption in location.Assumptions) intent.Assumptions[assumption.Key] = assumption.Value;
+            NormalizeLocationAssumptions(intent.Assumptions, resolvedConfidence, recommendationOptions.Value.UseMockProvider);
+            // Coordinates are now either user-supplied or genuinely geocoded, so they are safe to keep and to bias on.
+            var hasResolvedCoordinates = location.Latitude is not null && location.Longitude is not null;
             session.LocationMode = location.Mode;
             session.LocationText = location.Text;
-            session.Latitude = hasRealOrigin || recommendationOptions.Value.UseMockProvider ? location.Latitude : null;
-            session.Longitude = hasRealOrigin || recommendationOptions.Value.UseMockProvider ? location.Longitude : null;
+            session.Latitude = hasResolvedCoordinates ? location.Latitude : null;
+            session.Longitude = hasResolvedCoordinates ? location.Longitude : null;
             session.PlaceId = location.PlaceId;
             session.AssumptionsJson = JsonText.Serialize(intent.Assumptions);
 
             var weather = await weatherProvider.GetCurrentAsync(location.Latitude, location.Longitude, ct);
             session.WeatherContextJson = JsonText.Serialize(weather);
-            var providerLocation = hasRealOrigin || recommendationOptions.Value.UseMockProvider
-                ? new LocationInput(location.Mode, location.Text, location.Latitude, location.Longitude, location.PlaceId)
-                : new LocationInput(location.Mode, location.Text, null, null, location.PlaceId);
+            var providerLocation = new LocationInput(location.Mode, location.Text, location.Latitude, location.Longitude, location.PlaceId);
             var diningIntent = await BuildDiningIntentAsync(session, cues, context, providerLocation, ct);
             var candidates = await placeSearchProvider.SearchAsync(diningIntent, ct);
 
@@ -1429,7 +1571,13 @@ internal sealed class RecommendationProcessor(
                 var reservation = await reservations.ResolveAsync(place, ct);
                 var route = hasRealOrigin
                     ? await routes.CreateRouteUrlAsync(originalLocation.Lat!.Value, originalLocation.Lng!.Value, place.Latitude, place.Longitude, ct)
-                    : null;
+                    // A place id only helps Google when it really is a Google place id.
+                    : await routes.CreateDestinationUrlAsync(
+                        place.Name,
+                        place.Provider.Equals(GooglePlacesApi.Provider, StringComparison.OrdinalIgnoreCase) ? place.ProviderPlaceId : null,
+                        place.Latitude,
+                        place.Longitude,
+                        ct);
                 var title = DisplayText.CleanUiText(place.Name, false);
                 var headline = DisplayText.CleanUiText(recommendation.Label, false);
                 var placeName = DisplayText.CleanUiText(place.Name, false);
@@ -1501,9 +1649,9 @@ internal sealed class RecommendationProcessor(
             cues,
             context,
             location,
-            profile == null ? null : new ProfileDto(profile.DisplayName, profile.PreferredLanguage, profile.Country, profile.Currency, profile.DistanceUnit),
-            taste == null ? null : new TasteProfileDto(JsonText.Deserialize(taste.FavoriteCuisinesJson, Array.Empty<string>()), JsonText.Deserialize(taste.DislikedCuisinesJson, Array.Empty<string>()), JsonText.Deserialize(taste.FavoriteDishesJson, Array.Empty<string>()), JsonText.Deserialize(taste.DislikedIngredientsJson, Array.Empty<string>()), taste.SpiceTolerance, taste.SweetSaltyPreference, JsonText.Deserialize(taste.DrinkPreferencesJson, Array.Empty<string>()), JsonText.Deserialize(taste.DietaryRestrictionsJson, Array.Empty<string>()), JsonText.Deserialize(taste.AllergiesJson, Array.Empty<string>())),
-            dining == null ? null : new DiningProfileDto(dining.UsuallyWithKids, dining.PrefersQuietPlaces, dining.PrefersOutdoor, dining.BudgetSensitivity, dining.LikesLocalExperiences, dining.LikesPremiumPlaces, dining.NeedsParking, dining.NeedsAccessibility, dining.DefaultDistanceMeters),
+            profile == null ? null : ProfileMapping.ToDto(profile),
+            taste == null ? null : ProfileMapping.ToDto(taste),
+            dining == null ? null : ProfileMapping.ToDto(dining),
             saved.Select(x => new SavedPlaceDto(x.Id, x.Provider, x.ProviderPlaceId, x.RecommendationResultId, x.Name, x.Address, x.Note, x.CreatedAt)).ToList(),
             history);
     }
@@ -1821,35 +1969,337 @@ public static class RecommendationCandidateSearchPlanner
         terms.Any(term => value.Contains(term, StringComparison.OrdinalIgnoreCase));
 }
 
-internal sealed class GooglePlacesProvider(
-    HttpClient http,
-    Microsoft.Extensions.Options.IOptions<GooglePlacesOptions> options,
-    ILogger<GooglePlacesProvider> logger) : IPlaceSearchProvider
+/// <summary>
+/// Shared Google Places (v1) plumbing: the field masks and the place-to-candidate normalization used by
+/// the recommendation search provider, the restaurant/fit-check provider, and the location resolver.
+/// The metadata captured here is what grounds the model's copy, so the prompt can only claim what Places reports.
+/// </summary>
+internal static class GooglePlacesApi
 {
+    public const string SearchEndpoint = "https://places.googleapis.com/v1/places:searchText";
+    public const string DetailsEndpoint = "https://places.googleapis.com/v1/places/";
+    public const string Provider = "google_places";
+
+    private static readonly string[] PlaceFields =
+    [
+        "id",
+        "displayName",
+        "formattedAddress",
+        "location",
+        "rating",
+        "userRatingCount",
+        "priceLevel",
+        "types",
+        "primaryType",
+        "primaryTypeDisplayName",
+        "businessStatus",
+        "googleMapsUri",
+        "websiteUri",
+        "nationalPhoneNumber",
+        "editorialSummary",
+        "currentOpeningHours.openNow",
+        "regularOpeningHours.weekdayDescriptions",
+        "regularOpeningHours.periods",
+        "reservable",
+        "goodForChildren",
+        "goodForGroups",
+        "outdoorSeating",
+        "servesVegetarianFood",
+        "servesBreakfast",
+        "servesLunch",
+        "servesDinner",
+        "servesBeer",
+        "servesWine",
+        "allowsDogs",
+        "takeout",
+        "delivery",
+        "dineIn",
+        "parkingOptions",
+        "accessibilityOptions",
+        "photos"
+    ];
+
+    /// <summary>Field mask for places:searchText, where every field is nested under "places".</summary>
+    public static readonly string SearchFieldMask = string.Join(",", PlaceFields.Select(x => "places." + x));
+
+    /// <summary>Field mask for places.get, which returns a bare place object.</summary>
+    public static readonly string DetailsFieldMask = string.Join(",", PlaceFields);
+
+    /// <summary>Narrow mask used when we only need to turn free text into coordinates.</summary>
+    public const string GeocodeFieldMask = "places.id,places.location,places.formattedAddress,places.displayName";
+
     private static readonly HashSet<string> FoodTypes = new(StringComparer.OrdinalIgnoreCase)
     {
         "restaurant", "cafe", "bar", "bakery", "meal_takeaway", "meal_delivery", "food"
     };
 
+    /// <summary>
+    /// Maps one Places object (from either endpoint) to a candidate, dropping permanently closed places,
+    /// non-food places, and places without coordinates.
+    /// </summary>
+    public static PlaceCandidate? NormalizePlace(JsonNode? place)
+    {
+        var id = place?["id"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(id)) return null;
+        var businessStatus = place?["businessStatus"]?.GetValue<string>();
+        if (string.Equals(businessStatus, "CLOSED_PERMANENTLY", StringComparison.OrdinalIgnoreCase)) return null;
+        var types = ReadStringArray(place?["types"]);
+        var primaryType = place?["primaryType"]?.GetValue<string>();
+        if (!types.Any(FoodTypes.Contains) && (primaryType == null || !FoodTypes.Contains(primaryType))) return null;
+        var lat = ReadDouble(place?["location"]?["latitude"]);
+        var lng = ReadDouble(place?["location"]?["longitude"]);
+        if (lat is null || lng is null) return null;
+
+        var name = place?["displayName"]?["text"]?.GetValue<string>() ?? "Unnamed place";
+        return new PlaceCandidate(
+            Provider,
+            id,
+            name,
+            place?["formattedAddress"]?.GetValue<string>() ?? "",
+            lat.Value,
+            lng.Value,
+            ReadDecimal(place?["rating"]),
+            ReadInt(place?["userRatingCount"]),
+            ParsePriceLevel(place?["priceLevel"]?.GetValue<string>()),
+            BuildMetadataJson(place, types, primaryType, businessStatus));
+    }
+
+    /// <summary>
+    /// The metadata blob handed to the model. Keys are stable because prompts, the snapshot cache, and the
+    /// reservation resolver all read them; "openNow" in particular is read by <see cref="DisplayText"/>.
+    /// </summary>
+    private static string BuildMetadataJson(JsonNode? place, string[] types, string? primaryType, string? businessStatus)
+    {
+        var metadata = new Dictionary<string, object?>
+        {
+            ["googleMapsUri"] = place?["googleMapsUri"]?.GetValue<string>(),
+            ["websiteUri"] = place?["websiteUri"]?.GetValue<string>(),
+            ["phoneNumber"] = place?["nationalPhoneNumber"]?.GetValue<string>(),
+            ["types"] = types,
+            ["primaryType"] = primaryType,
+            ["primaryTypeLabel"] = place?["primaryTypeDisplayName"]?["text"]?.GetValue<string>(),
+            ["businessStatus"] = businessStatus,
+            ["editorialSummary"] = place?["editorialSummary"]?["text"]?.GetValue<string>(),
+            ["openNow"] = ReadBool(place?["currentOpeningHours"]?["openNow"]),
+            ["openingHours"] = ReadStringArray(place?["regularOpeningHours"]?["weekdayDescriptions"]),
+            ["openingPeriods"] = ReadOpeningPeriods(place?["regularOpeningHours"]?["periods"]),
+            ["reservable"] = ReadBool(place?["reservable"]),
+            ["goodForChildren"] = ReadBool(place?["goodForChildren"]),
+            ["goodForGroups"] = ReadBool(place?["goodForGroups"]),
+            ["outdoorSeating"] = ReadBool(place?["outdoorSeating"]),
+            ["servesVegetarianFood"] = ReadBool(place?["servesVegetarianFood"]),
+            ["servesBreakfast"] = ReadBool(place?["servesBreakfast"]),
+            ["servesLunch"] = ReadBool(place?["servesLunch"]),
+            ["servesDinner"] = ReadBool(place?["servesDinner"]),
+            ["servesBeer"] = ReadBool(place?["servesBeer"]),
+            ["servesWine"] = ReadBool(place?["servesWine"]),
+            ["allowsDogs"] = ReadBool(place?["allowsDogs"]),
+            ["takeout"] = ReadBool(place?["takeout"]),
+            ["delivery"] = ReadBool(place?["delivery"]),
+            ["dineIn"] = ReadBool(place?["dineIn"]),
+            ["parkingOptions"] = ReadFlagObject(place?["parkingOptions"]),
+            ["accessibilityOptions"] = ReadFlagObject(place?["accessibilityOptions"]),
+            ["photoCount"] = place?["photos"]?.AsArray().Count ?? 0
+        };
+        // Null values carry no grounding value and only inflate the prompt.
+        return JsonText.Serialize(metadata.Where(x => x.Value is not null).ToDictionary(x => x.Key, x => x.Value));
+    }
+
+    public static int? ParsePriceLevel(string? value) => value switch
+    {
+        "PRICE_LEVEL_FREE" => 0,
+        "PRICE_LEVEL_INEXPENSIVE" => 1,
+        "PRICE_LEVEL_MODERATE" => 2,
+        "PRICE_LEVEL_EXPENSIVE" => 3,
+        "PRICE_LEVEL_VERY_EXPENSIVE" => 4,
+        _ => null
+    };
+
+    public static string[] ReadStringArray(JsonNode? node)
+    {
+        if (node is not JsonArray array) return [];
+        return array
+            .Select(x => x is JsonValue value && value.TryGetValue<string>(out var text) ? text : null)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Cast<string>()
+            .ToArray();
+    }
+
+    /// <summary>Structured weekly periods, needed to reason about an intended visit time in fit check.</summary>
+    private static object[] ReadOpeningPeriods(JsonNode? node)
+    {
+        if (node is not JsonArray array) return [];
+        return array
+            .Select(period => new
+            {
+                openDay = ReadInt(period?["open"]?["day"]),
+                openHour = ReadInt(period?["open"]?["hour"]),
+                openMinute = ReadInt(period?["open"]?["minute"]),
+                closeDay = ReadInt(period?["close"]?["day"]),
+                closeHour = ReadInt(period?["close"]?["hour"]),
+                closeMinute = ReadInt(period?["close"]?["minute"])
+            })
+            .Where(x => x.openDay is not null)
+            .Cast<object>()
+            .Take(14)
+            .ToArray();
+    }
+
+    /// <summary>Places returns parking/accessibility as an object of booleans; keep only the true ones.</summary>
+    private static Dictionary<string, bool>? ReadFlagObject(JsonNode? node)
+    {
+        if (node is not JsonObject obj) return null;
+        var flags = new Dictionary<string, bool>(StringComparer.Ordinal);
+        foreach (var pair in obj)
+        {
+            var value = ReadBool(pair.Value);
+            if (value == true) flags[pair.Key] = true;
+        }
+        return flags.Count == 0 ? null : flags;
+    }
+
+    public static bool? ReadBool(JsonNode? node) =>
+        node is JsonValue value && value.TryGetValue<bool>(out var parsed) ? parsed : null;
+
+    public static int? ReadInt(JsonNode? node) =>
+        node is JsonValue value && value.TryGetValue<int>(out var parsed) ? parsed : null;
+
+    public static double? ReadDouble(JsonNode? node) =>
+        node is JsonValue value && value.TryGetValue<double>(out var parsed) ? parsed : null;
+
+    public static decimal? ReadDecimal(JsonNode? node) =>
+        node is JsonValue value && value.TryGetValue<decimal>(out var parsed) ? parsed : null;
+
+    /// <summary>Search radius: the user's own preferred distance wins over the global default.</summary>
+    public static int ResolveRadiusMeters(DiningProfileDto? diningProfile, GooglePlacesOptions config) =>
+        diningProfile is { DefaultDistanceMeters: > 0 }
+            ? Math.Clamp(diningProfile.DefaultDistanceMeters, 500, 20000)
+            : Math.Clamp(config.DefaultRadiusMeters, 100, 50000);
+}
+
+/// <summary>
+/// Read-through cache over the (already migrated but previously unused) restaurant_snapshots table.
+/// It keeps the richer field mask affordable and lets fit check reuse what a recommendation run already fetched.
+/// Runs in its own scope so it can never flush a caller's half-built entity graph.
+/// </summary>
+internal interface IRestaurantSnapshotStore
+{
+    Task<PlaceCandidate?> TryGetFreshAsync(string providerPlaceId, TimeSpan maxAge, CancellationToken cancellationToken);
+    Task UpsertAsync(IReadOnlyList<PlaceCandidate> candidates, CancellationToken cancellationToken);
+}
+
+internal sealed class RestaurantSnapshotStore(IServiceScopeFactory scopeFactory, ILogger<RestaurantSnapshotStore> logger) : IRestaurantSnapshotStore
+{
+    public async Task<PlaceCandidate?> TryGetFreshAsync(string providerPlaceId, TimeSpan maxAge, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(providerPlaceId) || maxAge <= TimeSpan.Zero) return null;
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<DineCueDbContext>();
+            var cutoff = DateTimeOffset.UtcNow - maxAge;
+            var snapshot = await db.RestaurantSnapshots.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Provider == GooglePlacesApi.Provider && x.ProviderPlaceId == providerPlaceId && x.FetchedAt >= cutoff, cancellationToken);
+            if (snapshot == null) return null;
+            return new PlaceCandidate(
+                snapshot.Provider,
+                snapshot.ProviderPlaceId,
+                snapshot.Name,
+                snapshot.Address,
+                snapshot.Latitude,
+                snapshot.Longitude,
+                snapshot.Rating,
+                snapshot.RatingCount,
+                snapshot.PriceLevel,
+                snapshot.RawProviderPayloadJson);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A cache miss must never break a recommendation or a fit check.
+            logger.LogWarning(ex, "Could not read restaurant snapshot cache.");
+            return null;
+        }
+    }
+
+    public async Task UpsertAsync(IReadOnlyList<PlaceCandidate> candidates, CancellationToken cancellationToken)
+    {
+        if (candidates.Count == 0) return;
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<DineCueDbContext>();
+            var ids = candidates.Select(x => x.ProviderPlaceId).Distinct(StringComparer.Ordinal).ToArray();
+            var existing = await db.RestaurantSnapshots
+                .Where(x => x.Provider == GooglePlacesApi.Provider && ids.Contains(x.ProviderPlaceId))
+                .ToDictionaryAsync(x => x.ProviderPlaceId, StringComparer.Ordinal, cancellationToken);
+
+            foreach (var candidate in candidates.GroupBy(x => x.ProviderPlaceId, StringComparer.Ordinal).Select(x => x.First()))
+            {
+                var metadata = JsonNode.Parse(string.IsNullOrWhiteSpace(candidate.RawPayloadJson) ? "{}" : candidate.RawPayloadJson) as JsonObject;
+                if (!existing.TryGetValue(candidate.ProviderPlaceId, out var snapshot))
+                {
+                    snapshot = new RestaurantSnapshot { Provider = candidate.Provider, ProviderPlaceId = candidate.ProviderPlaceId };
+                    db.RestaurantSnapshots.Add(snapshot);
+                }
+                snapshot.Name = candidate.Name;
+                snapshot.Address = candidate.Address;
+                snapshot.Latitude = candidate.Latitude;
+                snapshot.Longitude = candidate.Longitude;
+                snapshot.Rating = candidate.Rating;
+                snapshot.RatingCount = candidate.RatingCount;
+                snapshot.PriceLevel = candidate.PriceLevel;
+                snapshot.OpeningHoursJson = JsonText.Serialize(GooglePlacesApi.ReadStringArray(metadata?["openingHours"]));
+                snapshot.PhotosJson = JsonText.Serialize(Array.Empty<string>());
+                snapshot.WebsiteUrl = metadata?["websiteUri"]?.GetValue<string>();
+                snapshot.GoogleMapsUri = metadata?["googleMapsUri"]?.GetValue<string>();
+                snapshot.PhoneNumber = metadata?["phoneNumber"]?.GetValue<string>();
+                snapshot.RawProviderPayloadJson = candidate.RawPayloadJson;
+                snapshot.FetchedAt = DateTimeOffset.UtcNow;
+            }
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Caching is best effort; a concurrent writer losing the unique-index race must not fail the request.
+            logger.LogWarning(ex, "Could not write restaurant snapshot cache.");
+        }
+    }
+}
+
+internal sealed class GooglePlacesProvider(
+    HttpClient http,
+    Microsoft.Extensions.Options.IOptions<GooglePlacesOptions> options,
+    IRestaurantSnapshotStore snapshots,
+    IMemoryCache cache,
+    ILogger<GooglePlacesProvider> logger) : IPlaceSearchProvider
+{
     public async Task<IReadOnlyList<PlaceCandidate>> SearchAsync(DiningIntent intent, CancellationToken ct)
     {
         var config = options.Value;
+        var poolLimit = Math.Clamp(config.MaxCandidates, 15, 30);
+        var radiusMeters = GooglePlacesApi.ResolveRadiusMeters(intent.DiningProfile, config);
+        var queries = RecommendationCandidateSearchPlanner.BuildQueries(intent).Take(5).ToArray();
+        var cacheKey = BuildCacheKey(intent, queries, radiusMeters, poolLimit);
+        if (cache.TryGetValue(cacheKey, out IReadOnlyList<PlaceCandidate>? cached) && cached is { Count: > 0 })
+        {
+            logger.LogInformation("Google Places search served from cache with {CandidateCount} candidates", cached.Count);
+            return cached;
+        }
+
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.RequestTimeoutSeconds, 1, 60)));
         var requestCt = timeoutCts.Token;
-        var poolLimit = Math.Clamp(config.MaxCandidates, 15, 30);
         var perQueryLimit = Math.Clamp((int)Math.Ceiling(poolLimit / 3.0), 5, 10);
-        var queries = RecommendationCandidateSearchPlanner.BuildQueries(intent).Take(5).ToArray();
         var candidates = new List<PlaceCandidate>();
 
         try
         {
             foreach (var query in queries)
             {
-                using var request = new HttpRequestMessage(HttpMethod.Post, "https://places.googleapis.com/v1/places:searchText");
+                using var request = new HttpRequestMessage(HttpMethod.Post, GooglePlacesApi.SearchEndpoint);
                 request.Headers.TryAddWithoutValidation("X-Goog-Api-Key", config.ApiKey);
-                request.Headers.TryAddWithoutValidation("X-Goog-FieldMask", "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.priceLevel,places.types,places.primaryType,places.googleMapsUri,places.websiteUri,places.currentOpeningHours.openNow,places.businessStatus");
-                request.Content = new StringContent(BuildTextSearchRequestBody(intent, query, config, perQueryLimit), Encoding.UTF8, "application/json");
+                request.Headers.TryAddWithoutValidation("X-Goog-FieldMask", GooglePlacesApi.SearchFieldMask);
+                request.Content = new StringContent(BuildTextSearchRequestBody(intent, query, radiusMeters, perQueryLimit), Encoding.UTF8, "application/json");
 
                 using var response = await http.SendAsync(request, requestCt);
                 logger.LogInformation("Google Places search completed with status {StatusCode}", (int)response.StatusCode);
@@ -1863,7 +2313,7 @@ internal sealed class GooglePlacesProvider(
 
                 foreach (var place in places)
                 {
-                    var candidate = NormalizePlace(place);
+                    var candidate = GooglePlacesApi.NormalizePlace(place);
                     if (candidate == null) continue;
                     candidates.Add(candidate);
                 }
@@ -1872,11 +2322,16 @@ internal sealed class GooglePlacesProvider(
                     break;
             }
 
-            return RecommendationCandidateSearchPlanner.Deduplicate(candidates)
+            var pool = RecommendationCandidateSearchPlanner.Deduplicate(candidates)
                 .OrderByDescending(x => x.RatingCount ?? 0)
                 .ThenByDescending(x => x.Rating ?? 0)
                 .Take(poolLimit)
                 .ToList();
+
+            await snapshots.UpsertAsync(pool, ct);
+            if (pool.Count > 0)
+                cache.Set(cacheKey, (IReadOnlyList<PlaceCandidate>)pool, TimeSpan.FromMinutes(Math.Clamp(config.SearchCacheMinutes, 1, 180)));
+            return pool;
         }
         catch (ProviderFailureException)
         {
@@ -1894,7 +2349,15 @@ internal sealed class GooglePlacesProvider(
         }
     }
 
-    private static string BuildTextSearchRequestBody(DiningIntent intent, string query, GooglePlacesOptions config, int maxResults)
+    private static string BuildCacheKey(DiningIntent intent, string[] queries, int radiusMeters, int poolLimit)
+    {
+        // Coordinates are rounded to ~100 m so nearby retries and refinements share one cache entry.
+        var lat = intent.Location.Lat is null ? "-" : Math.Round(intent.Location.Lat.Value, 3).ToString(CultureInfo.InvariantCulture);
+        var lng = intent.Location.Lng is null ? "-" : Math.Round(intent.Location.Lng.Value, 3).ToString(CultureInfo.InvariantCulture);
+        return $"places:search:{intent.Language}:{lat}:{lng}:{radiusMeters}:{poolLimit}:{string.Join("|", queries)}";
+    }
+
+    internal static string BuildTextSearchRequestBody(DiningIntent intent, string query, int radiusMeters, int maxResults)
     {
         var queryParts = new[] { query, intent.Location.Text, "restaurant cafe bar" }
             .Where(x => !string.IsNullOrWhiteSpace(x))
@@ -1912,71 +2375,480 @@ internal sealed class GooglePlacesProvider(
                 circle = new
                 {
                     center = new { latitude = intent.Location.Lat, longitude = intent.Location.Lng },
-                    radius = Math.Clamp(config.DefaultRadiusMeters, 100, 50000)
+                    radius = radiusMeters
                 }
             };
         }
         return JsonText.Serialize(body);
     }
+}
 
-    private static PlaceCandidate? NormalizePlace(JsonNode? place)
+/// <summary>
+/// Real Google Places implementation of restaurant search and details, backing both the restaurant
+/// endpoints and fit check. Details reads go through the snapshot cache first, so repeatedly checking the
+/// same place (or fit-checking a place a recommendation run already fetched) costs nothing extra.
+/// </summary>
+internal sealed class GooglePlacesRestaurantProvider(
+    HttpClient http,
+    Microsoft.Extensions.Options.IOptions<GooglePlacesOptions> options,
+    IRestaurantSnapshotStore snapshots,
+    ILogger<GooglePlacesRestaurantProvider> logger) : IPlacesProvider
+{
+    public async Task<IReadOnlyList<PlaceCandidate>> SearchAsync(string query, ResolvedLocation location, string[] cues, CancellationToken cancellationToken)
     {
-        var id = place?["id"]?.GetValue<string>();
-        if (string.IsNullOrWhiteSpace(id)) return null;
-        var businessStatus = place?["businessStatus"]?.GetValue<string>();
-        if (string.Equals(businessStatus, "CLOSED_PERMANENTLY", StringComparison.OrdinalIgnoreCase)) return null;
-        var types = place?["types"]?.AsArray().Select(x => x?.GetValue<string>()).Where(x => !string.IsNullOrWhiteSpace(x)).Cast<string>().ToArray() ?? [];
-        var primaryType = place?["primaryType"]?.GetValue<string>();
-        if (!types.Any(FoodTypes.Contains) && (primaryType == null || !FoodTypes.Contains(primaryType))) return null;
-        var lat = place?["location"]?["latitude"]?.GetValue<double?>();
-        var lng = place?["location"]?["longitude"]?.GetValue<double?>();
-        if (lat is null || lng is null) return null;
+        var config = options.Value;
+        // "nearby" lets the fit-check flow list what is physically closest instead of what ranks best.
+        var rankByDistance = cues.Any(x => x.Equals("nearby", StringComparison.OrdinalIgnoreCase))
+            && location.Latitude is not null
+            && location.Longitude is not null;
 
-        var name = place?["displayName"]?["text"]?.GetValue<string>() ?? "Unnamed place";
-        var raw = JsonText.Serialize(new
+        var body = new Dictionary<string, object?>
         {
-            googleMapsUri = place?["googleMapsUri"]?.GetValue<string>(),
-            websiteUri = place?["websiteUri"]?.GetValue<string>(),
-            types,
-            primaryType,
-            openNow = place?["currentOpeningHours"]?["openNow"]?.GetValue<bool?>()
-        });
-        return new PlaceCandidate(
-            "google_places",
-            id,
-            name,
-            place?["formattedAddress"]?.GetValue<string>() ?? "",
-            lat.Value,
-            lng.Value,
-            place?["rating"]?.GetValue<decimal?>(),
-            place?["userRatingCount"]?.GetValue<int?>(),
-            ParsePriceLevel(place?["priceLevel"]?.GetValue<string>()),
-            raw);
+            ["textQuery"] = string.Join(" ", new[] { query, location.Text }.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase)),
+            ["maxResultCount"] = 12
+        };
+        if (location.Latitude is not null && location.Longitude is not null)
+        {
+            var circle = new
+            {
+                center = new { latitude = location.Latitude, longitude = location.Longitude },
+                radius = Math.Clamp(config.DefaultRadiusMeters, 100, 50000)
+            };
+            // Places rejects locationBias combined with DISTANCE ranking; restriction is the supported pairing.
+            if (rankByDistance)
+            {
+                body["rankPreference"] = "DISTANCE";
+                body["locationRestriction"] = new { circle };
+            }
+            else
+            {
+                body["locationBias"] = new { circle };
+            }
+        }
+
+        var json = await SendAsync(HttpMethod.Post, GooglePlacesApi.SearchEndpoint, GooglePlacesApi.SearchFieldMask, JsonText.Serialize(body), cancellationToken);
+        var places = json?["places"]?.AsArray();
+        if (places == null) return [];
+
+        var results = places
+            .Select(GooglePlacesApi.NormalizePlace)
+            .Where(x => x != null)
+            .Cast<PlaceCandidate>()
+            .ToList();
+        var deduped = RecommendationCandidateSearchPlanner.Deduplicate(results);
+        await snapshots.UpsertAsync(deduped, cancellationToken);
+
+        // Distance ranking is already ordered by the provider; otherwise prefer well-reviewed places.
+        return rankByDistance
+            ? deduped
+            : deduped.OrderByDescending(x => x.RatingCount ?? 0).ThenByDescending(x => x.Rating ?? 0).ToList();
     }
 
-    private static int? ParsePriceLevel(string? value) => value switch
+    public async Task<PlaceCandidate?> GetByPlaceIdAsync(string placeId, CancellationToken cancellationToken)
     {
-        "PRICE_LEVEL_INEXPENSIVE" => 1,
-        "PRICE_LEVEL_MODERATE" => 2,
-        "PRICE_LEVEL_EXPENSIVE" => 3,
-        "PRICE_LEVEL_VERY_EXPENSIVE" => 4,
-        _ => null
+        if (string.IsNullOrWhiteSpace(placeId)) return null;
+        var config = options.Value;
+        var cached = await snapshots.TryGetFreshAsync(placeId, TimeSpan.FromHours(Math.Clamp(config.SnapshotFreshnessHours, 1, 8760)), cancellationToken);
+        if (cached != null)
+        {
+            logger.LogInformation("Google Places details served from snapshot cache.");
+            return cached;
+        }
+
+        var json = await SendAsync(HttpMethod.Get, GooglePlacesApi.DetailsEndpoint + Uri.EscapeDataString(placeId), GooglePlacesApi.DetailsFieldMask, null, cancellationToken);
+        var place = GooglePlacesApi.NormalizePlace(json);
+        if (place != null) await snapshots.UpsertAsync([place], cancellationToken);
+        return place;
+    }
+
+    private async Task<JsonNode?> SendAsync(HttpMethod method, string url, string fieldMask, string? body, CancellationToken cancellationToken)
+    {
+        var config = options.Value;
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.RequestTimeoutSeconds, 1, 60)));
+            using var request = new HttpRequestMessage(method, url);
+            request.Headers.TryAddWithoutValidation("X-Goog-Api-Key", config.ApiKey);
+            request.Headers.TryAddWithoutValidation("X-Goog-FieldMask", fieldMask);
+            if (body != null) request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+
+            using var response = await http.SendAsync(request, timeoutCts.Token);
+            logger.LogInformation("Google Places {Method} completed with status {StatusCode}", method.Method, (int)response.StatusCode);
+            // A missing place is a 404 and must surface as "not found", not as a provider outage.
+            if (response.StatusCode == HttpStatusCode.NotFound) return null;
+            if (!response.IsSuccessStatusCode)
+                throw new ProviderFailureException("places_provider_failed", "We could not look up this place right now.");
+
+            await using var stream = await response.Content.ReadAsStreamAsync(timeoutCts.Token);
+            return await JsonNode.ParseAsync(stream, cancellationToken: timeoutCts.Token);
+        }
+        catch (ProviderFailureException)
+        {
+            throw;
+        }
+        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "Google Places request timed out.");
+            throw new ProviderFailureException("places_provider_failed", "We could not look up this place right now.", ex);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Google Places request failed.");
+            throw new ProviderFailureException("places_provider_failed", "We could not look up this place right now.", ex);
+        }
+    }
+}
+
+/// <summary>
+/// Turns a typed location ("Berlin Mitte") into real coordinates through Places text search.
+/// The mock resolver it replaces fell back to fixed Antalya coordinates, which silently biased every
+/// text-mode request to the wrong city. When lookup fails we return no coordinates rather than invent them:
+/// the search provider then omits locationBias and the place name stays in the query text.
+/// </summary>
+internal sealed class GoogleLocationResolver(
+    HttpClient http,
+    Microsoft.Extensions.Options.IOptions<GooglePlacesOptions> options,
+    IMemoryCache cache,
+    ILogger<GoogleLocationResolver> logger) : ILocationResolver
+{
+    public async Task<ResolvedLocation> ResolveAsync(LocationInput? input, CancellationToken cancellationToken)
+    {
+        var assumptions = new Dictionary<string, object>();
+        var mode = string.IsNullOrWhiteSpace(input?.Mode) ? "current" : input!.Mode;
+
+        if (input is { Lat: not null, Lng: not null })
+        {
+            assumptions["locationConfidence"] = "coordinates";
+            return new ResolvedLocation(mode, input.Text, input.Lat.Value, input.Lng.Value, input.PlaceId, assumptions);
+        }
+
+        var text = input?.Text?.Trim();
+        if (!string.IsNullOrWhiteSpace(text))
+        {
+            var resolved = await GeocodeAsync(text!, cancellationToken);
+            if (resolved != null)
+            {
+                assumptions["locationConfidence"] = "text_resolved";
+                return new ResolvedLocation(mode, resolved.Label ?? text, resolved.Latitude, resolved.Longitude, resolved.PlaceId ?? input?.PlaceId, assumptions);
+            }
+        }
+
+        assumptions["locationConfidence"] = "unresolved";
+        return new ResolvedLocation(mode, text, null, null, input?.PlaceId, assumptions);
+    }
+
+    private async Task<GeocodedPlace?> GeocodeAsync(string text, CancellationToken cancellationToken)
+    {
+        var config = options.Value;
+        var cacheKey = "places:geocode:" + text.ToLowerInvariant();
+        if (cache.TryGetValue(cacheKey, out GeocodedPlace? cached)) return cached;
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.RequestTimeoutSeconds, 1, 60)));
+            using var request = new HttpRequestMessage(HttpMethod.Post, GooglePlacesApi.SearchEndpoint);
+            request.Headers.TryAddWithoutValidation("X-Goog-Api-Key", config.ApiKey);
+            request.Headers.TryAddWithoutValidation("X-Goog-FieldMask", GooglePlacesApi.GeocodeFieldMask);
+            request.Content = new StringContent(JsonText.Serialize(new { textQuery = text, maxResultCount = 1 }), Encoding.UTF8, "application/json");
+
+            using var response = await http.SendAsync(request, timeoutCts.Token);
+            logger.LogInformation("Google Places geocode completed with status {StatusCode}", (int)response.StatusCode);
+            if (!response.IsSuccessStatusCode) return null;
+
+            await using var stream = await response.Content.ReadAsStreamAsync(timeoutCts.Token);
+            var json = await JsonNode.ParseAsync(stream, cancellationToken: timeoutCts.Token);
+            var place = json?["places"]?.AsArray().FirstOrDefault();
+            var lat = GooglePlacesApi.ReadDouble(place?["location"]?["latitude"]);
+            var lng = GooglePlacesApi.ReadDouble(place?["location"]?["longitude"]);
+            if (lat is null || lng is null) return null;
+
+            var resolved = new GeocodedPlace(
+                lat.Value,
+                lng.Value,
+                place?["formattedAddress"]?.GetValue<string>() ?? place?["displayName"]?["text"]?.GetValue<string>(),
+                place?["id"]?.GetValue<string>());
+            cache.Set(cacheKey, resolved, TimeSpan.FromHours(Math.Clamp(config.GeocodeCacheHours, 1, 720)));
+            return resolved;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            // A failed lookup degrades to a text-only search rather than failing the whole request.
+            logger.LogWarning(ex, "Google Places geocode failed.");
+            return null;
+        }
+    }
+
+    private sealed record GeocodedPlace(double Latitude, double Longitude, string? Label, string? PlaceId);
+}
+
+/// <summary>
+/// Derives reservation affordances from what Places actually reports (reservable flag, phone number,
+/// website, Maps URI) instead of the hard-coded example.com values the mock resolver returned.
+/// </summary>
+internal sealed class PlacesReservationLinkResolver : IReservationLinkResolver
+{
+    public Task<ReservationDto> ResolveAsync(PlaceCandidate place, CancellationToken cancellationToken)
+    {
+        var metadata = JsonNode.Parse(string.IsNullOrWhiteSpace(place.RawPayloadJson) ? "{}" : place.RawPayloadJson) as JsonObject;
+        var phone = Trimmed(metadata?["phoneNumber"]?.GetValue<string>());
+        var website = Trimmed(metadata?["websiteUri"]?.GetValue<string>());
+        var mapsUri = Trimmed(metadata?["googleMapsUri"]?.GetValue<string>())
+            ?? $"https://www.google.com/maps/search/?api=1&query={Uri.EscapeDataString(place.Name)}&query_place_id={Uri.EscapeDataString(place.ProviderPlaceId)}";
+        var reservable = GooglePlacesApi.ReadBool(metadata?["reservable"]);
+
+        // Confidence reflects how directly the signal came from the provider, never a guess about availability.
+        if (reservable == true && website != null)
+            return Task.FromResult(new ReservationDto("website_or_phone", "restaurant_website", website, phone, 0.8));
+        if (reservable == true && phone != null)
+            return Task.FromResult(new ReservationDto("phone_only", "phone", mapsUri, phone, 0.75));
+        if (reservable == true)
+            return Task.FromResult(new ReservationDto("reservable", "google_maps", mapsUri, null, 0.6));
+        if (phone != null)
+            return Task.FromResult(new ReservationDto("phone_only", "phone", mapsUri, phone, 0.55));
+        return Task.FromResult(new ReservationDto("google_maps_only", "google_maps", mapsUri, null, 0.5));
+    }
+
+    private static string? Trimmed(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+}
+
+/// <summary>
+/// Minimal JSON Schema builder for OpenAI structured outputs. Strict mode requires every object to list all
+/// of its properties in "required" and to set additionalProperties:false, which this enforces by construction.
+/// </summary>
+internal static class JsonSchema
+{
+    public static object Object(params (string Name, object Schema)[] properties) => new
+    {
+        type = "object",
+        additionalProperties = false,
+        required = properties.Select(x => x.Name).ToArray(),
+        properties = properties.ToDictionary(x => x.Name, x => x.Schema, StringComparer.Ordinal)
     };
+
+    public static object Text() => new { type = "string" };
+
+    /// <summary>Strict mode has no optional fields, so "may be absent" must be modelled as a string-or-null union.</summary>
+    public static object NullableText() => new { type = new[] { "string", "null" } };
+    public static object Enum(params string[] values) => new { type = "string", @enum = values };
+    public static object Integer() => new { type = "integer" };
+    public static object Number() => new { type = "number" };
+    public static object Bool() => new { type = "boolean" };
+    public static object List(object items) => new { type = "array", items };
+}
+
+/// <summary>
+/// One OpenAI chat-completions request that must come back as JSON.
+/// <paramref name="ImageDataUrls"/> turns it into a vision call (used by menu scanning).
+/// </summary>
+internal sealed record OpenAiJsonRequest(
+    string ErrorCode,
+    string ClientMessage,
+    string SystemPrompt,
+    string UserPrompt,
+    string SchemaName,
+    object Schema,
+    int MaxOutputTokens,
+    IReadOnlyList<string>? ImageDataUrls = null,
+    bool UseVisionModel = false);
+
+/// <summary>
+/// Shared transport for every OpenAI JSON call in the app (recommendation ranking, menu interpretation,
+/// restaurant fit check). It owns retries, Retry-After handling, timeouts, and structured-output formatting;
+/// callers own semantic validation and repair prompts. Logs never contain prompt or response bodies.
+/// </summary>
+internal sealed class OpenAiJsonClient(
+    HttpClient http,
+    Microsoft.Extensions.Options.IOptions<OpenAIOptions> options,
+    ILogger<OpenAiJsonClient> logger)
+{
+    private const string Endpoint = "https://api.openai.com/v1/chat/completions";
+
+    public async Task<JsonNode> CompleteAsync(OpenAiJsonRequest request, CancellationToken cancellationToken)
+    {
+        var config = options.Value;
+        var attempts = Math.Clamp(config.MaxTransportAttempts, 1, 5);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.RequestTimeoutSeconds, 1, 120)));
+        var requestCt = timeoutCts.Token;
+        Exception? lastError = null;
+
+        for (var attempt = 0; attempt < attempts; attempt++)
+        {
+            try
+            {
+                return await SendOnceAsync(request, config, requestCt);
+            }
+            catch (TransientOpenAiException ex)
+            {
+                lastError = ex.InnerException ?? ex;
+                if (attempt == attempts - 1) break;
+                var delay = ex.RetryAfter ?? BackoffDelay(attempt);
+                logger.LogWarning(
+                    "OpenAI call {SchemaName} failed transiently on attempt {Attempt}; retrying in {DelayMs} ms. Reason={Reason}",
+                    request.SchemaName, attempt + 1, (int)delay.TotalMilliseconds, ex.Message);
+                try
+                {
+                    await Task.Delay(delay, requestCt);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    // The per-call budget ran out while backing off; report it as a provider failure.
+                    break;
+                }
+            }
+        }
+
+        var isRateLimit = lastError is HttpRequestException { StatusCode: HttpStatusCode.TooManyRequests };
+        throw new ProviderFailureException(
+            isRateLimit ? RateLimitedCode(request.ErrorCode) : request.ErrorCode,
+            request.ClientMessage,
+            lastError);
+    }
+
+    private async Task<JsonNode> SendOnceAsync(OpenAiJsonRequest request, OpenAIOptions config, CancellationToken requestCt)
+    {
+        try
+        {
+            using var httpRequest = new HttpRequestMessage(HttpMethod.Post, Endpoint);
+            httpRequest.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ApiKey);
+            httpRequest.Content = new StringContent(BuildBody(request, config), Encoding.UTF8, "application/json");
+
+            using var response = await http.SendAsync(httpRequest, requestCt);
+            var requestId = response.Headers.TryGetValues("x-request-id", out var requestIds) ? requestIds.FirstOrDefault() : null;
+            var retryAfter = response.Headers.RetryAfter?.Delta;
+            logger.LogInformation(
+                "OpenAI call {SchemaName} completed with status {StatusCode}. RequestId={RequestId}, RetryAfterSeconds={RetryAfterSeconds}",
+                request.SchemaName, (int)response.StatusCode, requestId, retryAfter?.TotalSeconds);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var status = response.StatusCode;
+                if (status == HttpStatusCode.TooManyRequests || (int)status >= 500)
+                    throw new TransientOpenAiException($"status {(int)status}", retryAfter, new HttpRequestException($"OpenAI returned {(int)status}.", null, status));
+                // 4xx other than 429 will not improve on retry (bad key, bad request, model not available).
+                throw new ProviderFailureException(request.ErrorCode, request.ClientMessage);
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync(requestCt);
+            var json = await JsonNode.ParseAsync(stream, cancellationToken: requestCt);
+            var finishReason = json?["choices"]?[0]?["finish_reason"]?.GetValue<string>();
+            var content = json?["choices"]?[0]?["message"]?["content"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                // A length cutoff is worth retrying; an empty body for any other reason is not.
+                if (string.Equals(finishReason, "length", StringComparison.OrdinalIgnoreCase))
+                    throw new TransientOpenAiException("response truncated", null);
+                throw new ProviderFailureException(request.ErrorCode, request.ClientMessage);
+            }
+            return JsonNode.Parse(content) ?? throw new ProviderFailureException(request.ErrorCode, request.ClientMessage);
+        }
+        catch (TransientOpenAiException)
+        {
+            throw;
+        }
+        catch (ProviderFailureException)
+        {
+            throw;
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new TransientOpenAiException("network error", null, ex);
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            // Malformed JSON is worth one more shot; the caller's repair loop handles schema-level problems.
+            throw new TransientOpenAiException("invalid JSON body", null, ex);
+        }
+    }
+
+    private static string BuildBody(OpenAiJsonRequest request, OpenAIOptions config)
+    {
+        var model = request.UseVisionModel ? config.EffectiveVisionModel() : config.Model;
+        object responseFormat = config.UseStructuredOutputs
+            ? new { type = "json_schema", json_schema = new { name = request.SchemaName, strict = true, schema = request.Schema } }
+            : new { type = "json_object" };
+
+        return JsonText.Serialize(new
+        {
+            model,
+            temperature = 0.2,
+            top_p = 1,
+            max_completion_tokens = Math.Clamp(request.MaxOutputTokens, 256, 16384),
+            response_format = responseFormat,
+            messages = new object[]
+            {
+                new { role = "system", content = (object)request.SystemPrompt },
+                new { role = "user", content = BuildUserContent(request) }
+            }
+        });
+    }
+
+    private static object BuildUserContent(OpenAiJsonRequest request)
+    {
+        if (request.ImageDataUrls is not { Count: > 0 }) return request.UserPrompt;
+        var parts = new List<object> { new { type = "text", text = request.UserPrompt } };
+        foreach (var dataUrl in request.ImageDataUrls)
+            parts.Add(new { type = "image_url", image_url = new { url = dataUrl } });
+        return parts;
+    }
+
+    /// <summary>Jittered exponential backoff so concurrent jobs do not retry in lockstep.</summary>
+    private static TimeSpan BackoffDelay(int attempt) =>
+        TimeSpan.FromMilliseconds(Math.Min(4000, 400 * Math.Pow(3, attempt)) + Random.Shared.Next(0, 250));
+
+    private static string RateLimitedCode(string errorCode) =>
+        errorCode.EndsWith("_failed", StringComparison.Ordinal)
+            ? errorCode[..^"_failed".Length] + "_rate_limited"
+            : errorCode;
+
+    private sealed class TransientOpenAiException(string message, TimeSpan? retryAfter, Exception? innerException = null)
+        : Exception(message, innerException)
+    {
+        public TimeSpan? RetryAfter { get; } = retryAfter is { TotalSeconds: > 0 and <= 60 } ? retryAfter : null;
+    }
 }
 
 internal sealed class OpenAIRecommendationReasoner(
-    HttpClient http,
-    Microsoft.Extensions.Options.IOptions<OpenAIOptions> options,
+    OpenAiJsonClient client,
     ILogger<OpenAIRecommendationReasoner> logger) : IRecommendationReasoner
 {
+    internal const string ErrorCode = "reasoning_provider_failed";
+    internal const string ClientMessage = "We could not complete this recommendation right now.";
+
+    /// <summary>How many times we may ask the model to repair semantically invalid output.</summary>
+    private const int SemanticAttempts = 2;
+
+    internal const string SystemPrompt = "You are DineCue's dining assistant. Return only valid JSON. Pick only from candidate placeId values. Do not invent places or exact menu items. Write like a thoughtful person speaking directly to the diner: warm, natural, concise, and UI-ready. Before returning JSON, proofread every visible text field. Missing spaces between words are unacceptable. Do not concatenate Turkish words accidentally. Use natural punctuation. Never use backend, provider, product, debugging, or analysis language in user-facing fields. Avoid phrases like user request, candidate, provider data, session, request, context, criteria, Kullanıcının isteği, bu aday, Dinner için uygun, Nutzeranfrage, Kandidat, or Provider-Daten. For Turkish, write natural Turkish with correct spacing and punctuation. For English, use conversational English, not SaaS-style wording. For German, use natural conversational German, not literal English. Do not claim a place is family-friendly, quiet, reservation-capable, open, or otherwise guaranteed unless candidate metadata supports it. When certainty is limited, use soft wording: görünüyor, olabilir, kontrol etmek iyi olur, looks like, may be, worth checking, wirkt, könnte, es wäre gut zu prüfen. Supported languages: en, de, tr.";
+
+    /// <summary>Strict schema for structured outputs; mirrors the descriptive schema block in the prompt.</summary>
+    internal static readonly object ResponseSchema = JsonSchema.Object(
+        ("summary", JsonSchema.Text()),
+        ("interpretedIntent", JsonSchema.Object(
+            ("mealMoment", JsonSchema.Enum("breakfast", "lunch", "dinner", "coffee", "drinks", "dessert", "unknown")),
+            ("vibe", JsonSchema.Text()),
+            ("constraints", JsonSchema.List(JsonSchema.Text())),
+            ("language", JsonSchema.Enum("en", "de", "tr")))),
+        ("recommendations", JsonSchema.List(JsonSchema.Object(
+            ("placeId", JsonSchema.Text()),
+            ("rank", JsonSchema.Integer()),
+            ("label", JsonSchema.Text()),
+            ("matchScore", JsonSchema.Integer()),
+            ("reason", JsonSchema.Text()),
+            ("whyItFits", JsonSchema.List(JsonSchema.Text())),
+            ("watchOut", JsonSchema.List(JsonSchema.Text())),
+            ("bestFor", JsonSchema.List(JsonSchema.Text())),
+            ("confidence", JsonSchema.Enum("low", "medium", "high"))))));
+
     public async Task<RecommendationReasoningResult> RankAsync(DiningIntent intent, IReadOnlyList<PlaceCandidate> candidates, CancellationToken ct)
     {
         if (candidates.Count == 0)
-            throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
+            throw new ProviderFailureException(ErrorCode, ClientMessage);
 
         Exception? lastError = null;
         string? repairFeedback = null;
-        for (var attempt = 0; attempt < 2; attempt++)
+        for (var attempt = 0; attempt < SemanticAttempts; attempt++)
         {
             try
             {
@@ -1984,77 +2856,44 @@ internal sealed class OpenAIRecommendationReasoner(
                 Validate(result, candidates);
                 return result;
             }
-            catch (ProviderFailureException ex)
+            // Validation failures carry repair feedback, so the next attempt tells the model exactly what to fix.
+            catch (ProviderFailureException ex) when (!string.IsNullOrWhiteSpace(ex.RepairFeedback))
             {
-                if (string.IsNullOrWhiteSpace(ex.RepairFeedback))
-                    throw;
                 lastError = ex;
                 repairFeedback = ex.RepairFeedback;
+                logger.LogWarning("OpenAI recommendation output failed validation on attempt {Attempt}; asking for a repair.", attempt + 1);
+            }
+            // Transport problems were already retried inside the shared client; do not double up.
+            catch (ProviderFailureException)
+            {
+                throw;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 lastError = ex;
+                repairFeedback = "The previous response could not be read as the required JSON object. Return valid JSON that matches the schema exactly.";
+                logger.LogWarning(ex, "OpenAI recommendation output could not be parsed on attempt {Attempt}.", attempt + 1);
             }
         }
 
-        logger.LogWarning(lastError, "OpenAI recommendation reasoning failed validation.");
-        throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.", lastError);
+        logger.LogWarning(lastError, "OpenAI recommendation reasoning failed after {Attempts} attempts.", SemanticAttempts);
+        throw new ProviderFailureException(ErrorCode, ClientMessage, lastError);
     }
 
     private async Task<RecommendationReasoningResult> CallOpenAiAsync(DiningIntent intent, IReadOnlyList<PlaceCandidate> candidates, bool repair, string? repairFeedback, CancellationToken ct)
     {
-        var config = options.Value;
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.RequestTimeoutSeconds, 1, 120)));
-        var requestCt = timeoutCts.Token;
-        using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.openai.com/v1/chat/completions");
-        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ApiKey);
-        request.Content = new StringContent(JsonText.Serialize(new
-        {
-            model = config.Model,
-            temperature = 0.2,
-            response_format = new { type = "json_object" },
-            messages = new object[]
-            {
-                new { role = "system", content = "You are DineCue's dining assistant. Return only valid JSON. Pick only from candidate placeId values. Do not invent places or exact menu items. Write like a thoughtful person speaking directly to the diner: warm, natural, concise, and UI-ready. Before returning JSON, proofread every visible text field. Missing spaces between words are unacceptable. Do not concatenate Turkish words accidentally. Use natural punctuation. Never use backend, provider, product, debugging, or analysis language in user-facing fields. Avoid phrases like user request, candidate, provider data, session, request, context, criteria, Kullanıcının isteği, bu aday, Dinner için uygun, Nutzeranfrage, Kandidat, or Provider-Daten. For Turkish, write natural Turkish with correct spacing and punctuation. For English, use conversational English, not SaaS-style wording. For German, use natural conversational German, not literal English. Do not claim a place is family-friendly, quiet, reservation-capable, open, or otherwise guaranteed unless candidate metadata supports it. When certainty is limited, use soft wording: görünüyor, olabilir, kontrol etmek iyi olur, looks like, may be, worth checking, wirkt, könnte, es wäre gut zu prüfen. Supported languages: en, de, tr." },
-                new { role = "user", content = BuildPrompt(intent, candidates, repair, repairFeedback) }
-            }
-        }), Encoding.UTF8, "application/json");
-
-        try
-        {
-            using var response = await http.SendAsync(request, requestCt);
-            var requestId = response.Headers.TryGetValues("x-request-id", out var requestIds) ? requestIds.FirstOrDefault() : null;
-            var retryAfterSeconds = response.Headers.RetryAfter?.Delta?.TotalSeconds;
-            logger.LogInformation("OpenAI recommendation call completed with status {StatusCode}. RequestId={RequestId}, RetryAfterSeconds={RetryAfterSeconds}", (int)response.StatusCode, requestId, retryAfterSeconds);
-            if (!response.IsSuccessStatusCode)
-            {
-                if ((int)response.StatusCode == 429)
-                    throw new ProviderFailureException("reasoning_provider_rate_limited", "We could not complete this recommendation right now.");
-                throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
-            }
-
-            await using var stream = await response.Content.ReadAsStreamAsync(requestCt);
-            var json = await JsonNode.ParseAsync(stream, cancellationToken: requestCt);
-            var content = json?["choices"]?[0]?["message"]?["content"]?.GetValue<string>();
-            if (string.IsNullOrWhiteSpace(content))
-                throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
-            return ParseReasoning(content);
-        }
-        catch (ProviderFailureException)
-        {
-            throw;
-        }
-        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
-        {
-            logger.LogWarning(ex, "OpenAI recommendation call timed out.");
-            throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.", ex);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            logger.LogWarning(ex, "OpenAI recommendation call failed.");
-            throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.", ex);
-        }
+        var json = await client.CompleteAsync(
+            new OpenAiJsonRequest(
+                ErrorCode,
+                ClientMessage,
+                SystemPrompt,
+                BuildPrompt(intent, candidates, repair, repairFeedback),
+                "dinecue_recommendations",
+                ResponseSchema,
+                // Five cards of prose plus the intent block; scaled a little by how many candidates we describe.
+                MaxOutputTokens: Math.Clamp(1400 + (candidates.Count * 40), 1400, 4000)),
+            ct);
+        return ParseReasoning(json);
     }
 
     internal static string BuildPrompt(DiningIntent intent, IReadOnlyList<PlaceCandidate> candidates, bool repair, string? repairFeedback)
@@ -2119,9 +2958,8 @@ internal sealed class OpenAIRecommendationReasoner(
         return JsonText.Serialize(prompt);
     }
 
-    private static RecommendationReasoningResult ParseReasoning(string content)
+    private static RecommendationReasoningResult ParseReasoning(JsonNode json)
     {
-        var json = JsonNode.Parse(content) ?? throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
         var recommendations = json["recommendations"]?.AsArray().Select(x => new ReasonedRecommendation(
             DisplayText.CleanInline(x?["placeId"]?.GetValue<string>() ?? "", false),
             ReadInt(x?["rank"], 0),
@@ -2138,22 +2976,43 @@ internal sealed class OpenAIRecommendationReasoner(
             recommendations);
     }
 
-    private static void Validate(RecommendationReasoningResult result, IReadOnlyList<PlaceCandidate> candidates)
+    /// <summary>
+    /// Semantic checks the schema cannot express (placeIds must exist, ranks must be unique, scores in range).
+    /// Every failure carries actionable repair feedback so the retry is a targeted fix, not a blind re-roll.
+    /// </summary>
+    internal static void Validate(RecommendationReasoningResult result, IReadOnlyList<PlaceCandidate> candidates)
     {
         var candidateIds = candidates.Select(x => x.ProviderPlaceId).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var ranks = new HashSet<int>();
         var language = result.InterpretedIntent.TryGetValue("language", out var value) ? value?.ToString() : null;
-        _ = SupportedLanguages.NormalizeRequired(language);
+        try
+        {
+            _ = SupportedLanguages.NormalizeRequired(language);
+        }
+        catch (ApiException)
+        {
+            throw RepairNeeded($"interpretedIntent.language must be exactly one of en, de, tr but was '{language}'.");
+        }
+
         if (result.Recommendations.Count is < 1 or > 5)
-            throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
+            throw RepairNeeded($"recommendations must contain between 1 and 5 items but contained {result.Recommendations.Count}.");
+
         foreach (var rec in result.Recommendations)
         {
-            if (!candidateIds.Contains(rec.PlaceId) || !ranks.Add(rec.Rank) || rec.MatchScore is < 0 or > 100)
-                throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
+            if (!candidateIds.Contains(rec.PlaceId))
+                throw RepairNeeded($"placeId '{rec.PlaceId}' is not in the candidate list. Use only placeId values supplied in candidates.");
+            if (!ranks.Add(rec.Rank))
+                throw RepairNeeded($"rank {rec.Rank} was used more than once. Ranks must be unique and start at 1.");
+            if (rec.MatchScore is < 0 or > 100)
+                throw RepairNeeded($"matchScore for placeId '{rec.PlaceId}' was {rec.MatchScore}, which is outside the allowed range 0-100.");
             if (!new[] { "low", "medium", "high" }.Contains(rec.Confidence, StringComparer.OrdinalIgnoreCase))
-                throw new ProviderFailureException("reasoning_provider_failed", "We could not complete this recommendation right now.");
+                throw RepairNeeded($"confidence for placeId '{rec.PlaceId}' was '{rec.Confidence}'. It must be exactly low, medium, or high.");
         }
     }
+
+    private static ProviderFailureException RepairNeeded(string detail) =>
+        new(ErrorCode, ClientMessage, repairFeedback:
+            detail + " Fix only this problem. Keep the same JSON shape, keep the same selected placeIds and ranks where they were valid, and do not invent restaurants or menu items.");
 
     private static int ReadInt(JsonNode? node, int fallback)
     {
@@ -2429,13 +3288,20 @@ internal sealed class MockRecommendationReasoner(IAiPlaceRanker ranker) : IRecom
     }
 }
 
-internal sealed class RestaurantService(IPlacesProvider places, ILocationResolver locations, IReservationLinkResolver reservations, IAiRestaurantFitAnalyzer fit, IInteractionEventService events, IQuotaService quota) : IRestaurantService
+internal sealed class RestaurantService(
+    DineCueDbContext db,
+    IPlacesProvider places,
+    ILocationResolver locations,
+    IReservationLinkResolver reservations,
+    IAiRestaurantFitAnalyzer fit,
+    IInteractionEventService events,
+    IQuotaService quota) : IRestaurantService
 {
     public async Task<IReadOnlyList<RestaurantSearchResultDto>> SearchAsync(RestaurantSearchRequest request, CancellationToken ct)
     {
         RequestValidation.RestaurantSearch(request);
         var location = await locations.ResolveAsync(request.Location, ct);
-        var found = await places.SearchAsync(request.Query, location, [], ct);
+        var found = await places.SearchAsync(request.Query, location, request.Cues ?? [], ct);
         var result = new List<RestaurantSearchResultDto>();
         foreach (var place in found)
         {
@@ -2448,7 +3314,22 @@ internal sealed class RestaurantService(IPlacesProvider places, ILocationResolve
     {
         var place = await places.GetByPlaceIdAsync(placeId, ct) ?? throw new ApiException("not_found", "Restaurant was not found.", 404);
         var reservation = await reservations.ResolveAsync(place, ct);
-        return new(place.Provider, place.ProviderPlaceId, place.Name, place.Address, place.Latitude, place.Longitude, place.Rating, place.RatingCount, place.PriceLevel, "https://example.com/" + place.ProviderPlaceId, "https://maps.google.com/?q=" + Uri.EscapeDataString(place.Name), "+90 242 000 0000", reservation);
+        // Website, maps URI, and phone come from provider metadata; there are no placeholder values here.
+        var metadata = JsonText.Deserialize(place.RawPayloadJson, new Dictionary<string, object>());
+        return new(
+            place.Provider,
+            place.ProviderPlaceId,
+            place.Name,
+            place.Address,
+            place.Latitude,
+            place.Longitude,
+            place.Rating,
+            place.RatingCount,
+            place.PriceLevel,
+            ReadMetadataString(metadata, "websiteUri"),
+            ReadMetadataString(metadata, "googleMapsUri"),
+            ReadMetadataString(metadata, "phoneNumber"),
+            reservation);
     }
     public async Task<RestaurantFitCheckResponse> FitCheckAsync(Guid userId, string placeId, RestaurantFitCheckRequest request, CancellationToken ct)
     {
@@ -2460,7 +3341,17 @@ internal sealed class RestaurantService(IPlacesProvider places, ILocationResolve
         {
             var place = await places.GetByPlaceIdAsync(placeId, ct) ?? throw new ApiException("not_found", "Restaurant was not found.", 404);
             var reservation = await reservations.ResolveAsync(place, ct);
-            var response = await fit.AnalyzeAsync(place, request, reservation, ct);
+            var taste = await db.TasteProfiles.AsNoTracking().FirstOrDefaultAsync(x => x.UserId == userId, ct);
+            var dining = await db.DiningProfiles.AsNoTracking().FirstOrDefaultAsync(x => x.UserId == userId, ct);
+            var context = new RestaurantFitContext(
+                place,
+                request,
+                reservation,
+                taste == null ? null : ProfileMapping.ToDto(taste),
+                dining == null ? null : ProfileMapping.ToDto(dining),
+                ReadVisitAt(request.Context));
+            var response = await fit.AnalyzeAsync(context, ct);
+            await PersistInsightAsync(placeId, language, response, ct);
             await events.TrackAsync(userId, new InteractionEventRequest("RestaurantFitChecked", "Restaurant", placeId, new Dictionary<string, object> { ["fitScore"] = response.FitScore }), ct);
             return response;
         }
@@ -2470,41 +3361,739 @@ internal sealed class RestaurantService(IPlacesProvider places, ILocationResolve
             throw;
         }
     }
+
+    /// <summary>
+    /// Keeps the fit narrative for later aggregate signals. It is never served from here: the verdict is
+    /// personal to the diner who asked, so replaying another person's answer would be wrong.
+    /// </summary>
+    private async Task PersistInsightAsync(string placeId, string language, RestaurantFitCheckResponse response, CancellationToken ct)
+    {
+        db.RestaurantInsights.Add(new RestaurantInsight
+        {
+            ProviderPlaceId = placeId,
+            Language = language,
+            Summary = response.Summary,
+            ProsJson = JsonText.Serialize(response.Pros),
+            ConsJson = JsonText.Serialize(response.Cons)
+        });
+        await db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>Reads an optional ISO-8601 intended visit time out of the free-form context bag.</summary>
+    internal static DateTimeOffset? ReadVisitAt(Dictionary<string, object>? context)
+    {
+        if (context == null || !context.TryGetValue("visitAt", out var value) || value is null) return null;
+        var text = value is JsonElement element ? element.ToString() : value.ToString();
+        return DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsed) ? parsed : null;
+    }
+
+    private static string? ReadMetadataString(Dictionary<string, object> metadata, string key)
+    {
+        if (!metadata.TryGetValue(key, out var value) || value is null) return null;
+        var text = value is JsonElement element ? element.ToString() : value.ToString();
+        return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
 }
 
-internal sealed class MenuScanService(DineCueDbContext db, IMenuOcrProvider ocr, IAiMenuInterpreter ai, IInteractionEventService events, IQuotaService quota) : IMenuScanService
+/// <summary>
+/// Google Cloud Storage backed image store. Credentials come from Application Default Credentials, which on
+/// Cloud Run means the service account, so no new secret is introduced. The bucket stays private.
+/// </summary>
+internal sealed class GcsObjectStorage(
+    Microsoft.Extensions.Options.IOptions<StorageOptions> options,
+    ILogger<GcsObjectStorage> logger) : IObjectStorage, IDisposable
 {
-    public async Task<MenuScanResponse> CreateAsync(Guid userId, MenuScanRequest request, CancellationToken ct)
+    // Credential discovery is not free, so the client is created once on first use.
+    private readonly Lazy<Google.Cloud.Storage.V1.StorageClient> client =
+        new(Google.Cloud.Storage.V1.StorageClient.Create, LazyThreadSafetyMode.ExecutionAndPublication);
+
+    public async Task PutAsync(string objectName, Stream content, string contentType, CancellationToken cancellationToken)
     {
-        RequestValidation.MenuScan(request);
+        var bucket = options.Value.Bucket;
+        await client.Value.UploadObjectAsync(bucket, objectName, contentType, content, cancellationToken: cancellationToken);
+        logger.LogInformation("Stored object in bucket with content type {ContentType}", contentType);
+    }
+
+    public async Task<Stream?> OpenReadAsync(string objectName, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var buffer = new MemoryStream();
+            await client.Value.DownloadObjectAsync(options.Value.Bucket, objectName, buffer, cancellationToken: cancellationToken);
+            buffer.Position = 0;
+            return buffer;
+        }
+        catch (Google.GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+    }
+
+    public async Task DeleteAsync(string objectName, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await client.Value.DeleteObjectAsync(options.Value.Bucket, objectName, cancellationToken: cancellationToken);
+        }
+        catch (Google.GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.NotFound)
+        {
+            // Already gone; deleting is idempotent from the caller's point of view.
+        }
+    }
+
+    public void Dispose()
+    {
+        if (client.IsValueCreated) client.Value.Dispose();
+    }
+}
+
+/// <summary>In-process storage for local development and tests, used whenever Storage:Enabled is false.</summary>
+internal sealed class InMemoryObjectStorage : IObjectStorage
+{
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte[]> objects = new(StringComparer.Ordinal);
+
+    public async Task PutAsync(string objectName, Stream content, string contentType, CancellationToken cancellationToken)
+    {
+        using var buffer = new MemoryStream();
+        await content.CopyToAsync(buffer, cancellationToken);
+        objects[objectName] = buffer.ToArray();
+    }
+
+    public Task<Stream?> OpenReadAsync(string objectName, CancellationToken cancellationToken) =>
+        Task.FromResult<Stream?>(objects.TryGetValue(objectName, out var bytes) ? new MemoryStream(bytes) : null);
+
+    public Task DeleteAsync(string objectName, CancellationToken cancellationToken)
+    {
+        objects.TryRemove(objectName, out _);
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Validates that an upload really is one of the allowed image formats by inspecting its leading bytes,
+/// rather than trusting the client-declared content type or the file extension.
+/// </summary>
+internal static class ImageContentType
+{
+    public const string Jpeg = "image/jpeg";
+    public const string Png = "image/png";
+    public const string WebP = "image/webp";
+
+    public static string? Detect(ReadOnlySpan<byte> header)
+    {
+        if (header.Length >= 3 && header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF) return Jpeg;
+        if (header.Length >= 8 && header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47
+            && header[4] == 0x0D && header[5] == 0x0A && header[6] == 0x1A && header[7] == 0x0A) return Png;
+        if (header.Length >= 12
+            && header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F'
+            && header[8] == 'W' && header[9] == 'E' && header[10] == 'B' && header[11] == 'P') return WebP;
+        return null;
+    }
+
+    public static string Extension(string contentType) => contentType switch
+    {
+        Png => "png",
+        WebP => "webp",
+        _ => "jpg"
+    };
+}
+
+internal sealed class InMemoryMenuScanJobQueue : IMenuScanJobQueue
+{
+    private readonly Channel<MenuScanJob> channel = Channel.CreateUnbounded<MenuScanJob>(
+        new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+
+    public ValueTask EnqueueAsync(MenuScanJob job, CancellationToken cancellationToken) =>
+        channel.Writer.WriteAsync(job, cancellationToken);
+
+    public ValueTask<MenuScanJob> DequeueAsync(CancellationToken cancellationToken) =>
+        channel.Reader.ReadAsync(cancellationToken);
+}
+
+/// <summary>
+/// Runs queued menu scans. Mirrors <see cref="RecommendationProcessingWorker"/> deliberately: a second,
+/// independent queue keeps a slow vision call from blocking recommendation jobs.
+/// </summary>
+internal sealed class MenuScanProcessingWorker(
+    IMenuScanJobQueue queue,
+    IServiceScopeFactory scopeFactory,
+    Microsoft.Extensions.Options.IOptions<StorageOptions> storageOptions,
+    ILogger<MenuScanProcessingWorker> logger) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await RequeueIncompleteScansAsync(stoppingToken);
+        await SweepOrphanImagesAsync(stoppingToken);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            MenuScanJob job;
+            try
+            {
+                job = await queue.DequeueAsync(stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            try
+            {
+                using var scope = scopeFactory.CreateScope();
+                var processor = scope.ServiceProvider.GetRequiredService<MenuScanProcessor>();
+                await processor.ProcessAsync(job, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Unhandled menu scan worker error for scan {MenuScanId} with {FailureType}", job.MenuScanId, ex.GetType().Name);
+                await MarkUnhandledJobFailedAsync(job, ex, stoppingToken);
+            }
+        }
+    }
+
+    private async Task MarkUnhandledJobFailedAsync(MenuScanJob job, Exception ex, CancellationToken stoppingToken)
+    {
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<DineCueDbContext>();
+            var quota = scope.ServiceProvider.GetRequiredService<IQuotaService>();
+            var scan = await db.MenuScans.FirstOrDefaultAsync(x => x.Id == job.MenuScanId && x.UserId == job.UserId, stoppingToken);
+            if (scan == null || scan.Status is "completed" or "failed") return;
+
+            var failure = ex as ProviderFailureException;
+            scan.Status = "failed";
+            scan.CurrentStep = null;
+            scan.FailedAt = DateTimeOffset.UtcNow;
+            scan.ErrorCode = failure?.Code ?? "menu_scan_failed";
+            scan.ErrorMessage = failure?.ClientMessage ?? "We could not read this menu right now.";
+            await quota.ReleaseMenuScanAsync(scan.UserId, stoppingToken);
+            await db.SaveChangesAsync(stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception markFailedError)
+        {
+            logger.LogWarning(markFailedError, "Could not mark menu scan {MenuScanId} failed after worker error.", job.MenuScanId);
+        }
+    }
+
+    private async Task RequeueIncompleteScansAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<DineCueDbContext>();
+            var scans = await db.MenuScans
+                .Where(x => x.Status == "queued" || x.Status == "running")
+                .ToListAsync(stoppingToken);
+            foreach (var scan in scans)
+            {
+                if (scan.Status == "running")
+                {
+                    scan.Status = "queued";
+                    scan.CurrentStep = null;
+                }
+                await queue.EnqueueAsync(new MenuScanJob(scan.Id, scan.UserId), stoppingToken);
+            }
+            await db.SaveChangesAsync(stoppingToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Could not requeue incomplete menu scans on startup.");
+        }
+    }
+
+    /// <summary>Deletes images that were uploaded but never turned into a scan, so abandoned uploads do not accumulate.</summary>
+    private async Task SweepOrphanImagesAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<DineCueDbContext>();
+            var storage = scope.ServiceProvider.GetRequiredService<IObjectStorage>();
+            var cutoff = DateTimeOffset.UtcNow - TimeSpan.FromHours(Math.Clamp(storageOptions.Value.OrphanImageRetentionHours, 1, 720));
+            var orphans = await db.MenuScanImages
+                .Where(x => x.MenuScanId == null && x.CreatedAt < cutoff)
+                .Take(500)
+                .ToListAsync(stoppingToken);
+            if (orphans.Count == 0) return;
+
+            foreach (var orphan in orphans)
+                await storage.DeleteAsync(orphan.ObjectName, stoppingToken);
+            db.MenuScanImages.RemoveRange(orphans);
+            await db.SaveChangesAsync(stoppingToken);
+            logger.LogInformation("Swept {OrphanCount} unattached menu images.", orphans.Count);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Could not sweep unattached menu images on startup.");
+        }
+    }
+}
+
+/// <summary>
+/// Reads the menu images, interprets them for this specific diner, applies the dietary safety rules, and
+/// persists the result. Mirrors the recommendation processor's step/status/quota-release conventions.
+/// </summary>
+internal sealed class MenuScanProcessor(
+    DineCueDbContext db,
+    IObjectStorage storage,
+    IAiMenuInterpreter interpreter,
+    IQuotaService quota,
+    IInteractionEventService events,
+    Microsoft.Extensions.Options.IOptions<StorageOptions> storageOptions,
+    ILogger<MenuScanProcessor> logger)
+{
+    public async Task ProcessAsync(MenuScanJob job, CancellationToken ct)
+    {
+        var scan = await db.MenuScans.FirstOrDefaultAsync(x => x.Id == job.MenuScanId && x.UserId == job.UserId, ct);
+        if (scan == null) return;
+        if (scan.Status is "completed" or "running") return;
+
+        try
+        {
+            scan.Status = "running";
+            scan.CurrentStep = "reading_menu";
+            scan.StartedAt ??= DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+
+            var images = await db.MenuScanImages.AsNoTracking()
+                .Where(x => x.MenuScanId == scan.Id)
+                .OrderBy(x => x.Position)
+                .ToListAsync(ct);
+            var dataUrls = await LoadImageDataUrlsAsync(images, ct);
+            if (dataUrls.Count == 0 && string.IsNullOrWhiteSpace(scan.OcrText))
+                throw new ProviderFailureException("menu_not_readable", "We could not read this menu. Try a clearer photo of the menu page.");
+
+            var request = await BuildInterpretationRequestAsync(scan, dataUrls, ct);
+            var result = await interpreter.InterpretAsync(request, ct);
+            if (!result.Readable)
+                throw new ProviderFailureException("menu_not_readable", "We could not read this menu. Try a clearer photo of the menu page.");
+
+            scan.CurrentStep = "matching_preferences";
+            await db.SaveChangesAsync(ct);
+
+            // Safety rules are applied here, not left to the model, so they hold even if the model forgets them.
+            var interpretation = MenuSafety.Apply(result.Interpretation, request.TasteProfile, scan.Language);
+
+            await ClearPreviousResultsAsync(scan.Id, ct);
+            PersistInterpretation(scan, interpretation, result.OcrText);
+
+            scan.Status = "completed";
+            scan.CurrentStep = null;
+            scan.CompletedAt = DateTimeOffset.UtcNow;
+            scan.ErrorCode = null;
+            scan.ErrorMessage = null;
+            await events.TrackAsync(scan.UserId, new InteractionEventRequest("MenuScanCreated", "MenuScan", scan.Id.ToString(), null), ct);
+            await db.SaveChangesAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            var failure = ex as ProviderFailureException;
+            logger.LogWarning(ex, "Menu scan job failed for scan {MenuScanId} with {FailureType} and {ErrorCode}", job.MenuScanId, ex.GetType().Name, failure?.Code ?? "menu_scan_failed");
+            scan.Status = "failed";
+            scan.CurrentStep = null;
+            scan.FailedAt = DateTimeOffset.UtcNow;
+            scan.ErrorCode = failure?.Code ?? "menu_scan_failed";
+            scan.ErrorMessage = failure?.ClientMessage ?? "We could not read this menu right now.";
+            await quota.ReleaseMenuScanAsync(scan.UserId, ct);
+            await db.SaveChangesAsync(ct);
+        }
+    }
+
+    /// <summary>
+    /// Removes a previous interpretation before writing a new one. A scan holds at most a few dozen rows, so
+    /// loading them is cheap and keeps the flow usable with any EF provider.
+    /// </summary>
+    internal async Task ClearPreviousResultsAsync(Guid menuScanId, CancellationToken ct)
+    {
+        var items = await db.MenuScanItems.Where(x => x.MenuScanId == menuScanId).ToListAsync(ct);
+        var recommendations = await db.MenuScanRecommendations.Where(x => x.MenuScanId == menuScanId).ToListAsync(ct);
+        if (items.Count > 0) db.MenuScanItems.RemoveRange(items);
+        if (recommendations.Count > 0) db.MenuScanRecommendations.RemoveRange(recommendations);
+    }
+
+    internal void PersistInterpretation(MenuScan scan, MenuInterpretation interpretation, string ocrText)
+    {
+        scan.OcrText = string.IsNullOrWhiteSpace(ocrText) ? scan.OcrText : ocrText;
+        scan.Language = SupportedLanguages.NormalizeOrDefault(interpretation.DetectedLanguage);
+        scan.RawAiResponseJson = JsonText.Serialize(interpretation);
+        foreach (var item in interpretation.Items)
+        {
+            db.MenuScanItems.Add(new MenuScanItem
+            {
+                MenuScanId = scan.Id,
+                Name = item.Name,
+                Description = item.Description,
+                Category = item.Category,
+                PriceText = item.PriceText,
+                DetectedLanguage = scan.Language,
+                PossibleAllergensJson = JsonText.Serialize(item.PossibleAllergens),
+                IsKidFriendly = item.IsKidFriendly,
+                IsVegetarian = item.IsVegetarian,
+                IsSpicy = item.IsSpicy
+            });
+        }
+        foreach (var recommendation in interpretation.Recommendations)
+        {
+            db.MenuScanRecommendations.Add(new MenuScanRecommendation
+            {
+                MenuScanId = scan.Id,
+                ItemName = recommendation.ItemName,
+                Reason = recommendation.Reason,
+                SuitabilityScore = recommendation.SuitabilityScore,
+                WarningsJson = JsonText.Serialize(recommendation.Warnings)
+            });
+        }
+    }
+
+    internal async Task<MenuInterpretationRequest> BuildInterpretationRequestAsync(MenuScan scan, IReadOnlyList<string> dataUrls, CancellationToken ct)
+    {
+        var taste = await db.TasteProfiles.AsNoTracking().FirstOrDefaultAsync(x => x.UserId == scan.UserId, ct);
+        var dining = await db.DiningProfiles.AsNoTracking().FirstOrDefaultAsync(x => x.UserId == scan.UserId, ct);
+        string? restaurantMetadata = null;
+        if (!string.IsNullOrWhiteSpace(scan.RestaurantPlaceId))
+        {
+            // Reuses whatever a recommendation run already cached; never triggers a paid lookup.
+            restaurantMetadata = await db.RestaurantSnapshots.AsNoTracking()
+                .Where(x => x.ProviderPlaceId == scan.RestaurantPlaceId)
+                .Select(x => x.RawProviderPayloadJson)
+                .FirstOrDefaultAsync(ct);
+        }
+
+        return new MenuInterpretationRequest(
+            scan.OcrText,
+            dataUrls,
+            scan.Language,
+            scan.RawTextInput,
+            JsonText.Deserialize(scan.SelectedCuesJson, Array.Empty<string>()),
+            JsonText.Deserialize(scan.DiningContextJson, new Dictionary<string, object>()),
+            taste == null ? null : ProfileMapping.ToDto(taste),
+            dining == null ? null : ProfileMapping.ToDto(dining),
+            restaurantMetadata);
+    }
+
+    private async Task<List<string>> LoadImageDataUrlsAsync(List<MenuScanImage> images, CancellationToken ct)
+    {
+        var limit = storageOptions.Value.EffectiveMaxImagesPerScan();
+        var dataUrls = new List<string>();
+        foreach (var image in images.Take(limit))
+        {
+            await using var content = await storage.OpenReadAsync(image.ObjectName, ct);
+            if (content == null)
+            {
+                logger.LogWarning("Menu image object was missing from storage for scan {MenuScanId}.", image.MenuScanId);
+                continue;
+            }
+            using var buffer = new MemoryStream();
+            await content.CopyToAsync(buffer, ct);
+            dataUrls.Add($"data:{image.ContentType};base64,{Convert.ToBase64String(buffer.ToArray())}");
+        }
+        return dataUrls;
+    }
+}
+
+/// <summary>
+/// Dietary safety rules that must hold regardless of what the model returned: the allergen disclaimer is
+/// always present in the diner's language, and any recommended item that conflicts with a stored allergy or
+/// dietary restriction is demoted from a suggestion to a warning.
+/// </summary>
+internal static class MenuSafety
+{
+    public static MenuInterpretation Apply(MenuInterpretation interpretation, TasteProfileDto? taste, string language)
+    {
+        var blocked = (taste?.Allergies ?? [])
+            .Concat(taste?.DietaryRestrictions ?? [])
+            .Concat(taste?.DislikedIngredients ?? [])
+            .Select(x => x?.Trim())
+            .Where(x => !string.IsNullOrWhiteSpace(x) && x!.Length >= 3)
+            .Select(x => x!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var itemsByName = interpretation.Items.ToDictionary(x => x.Name, StringComparer.OrdinalIgnoreCase);
+        var keptRecommendations = new List<MenuRecommendationDto>();
+        var extraWarnings = new List<string>();
+
+        foreach (var recommendation in interpretation.Recommendations)
+        {
+            var conflict = FindConflict(recommendation, itemsByName, blocked);
+            if (conflict == null)
+            {
+                keptRecommendations.Add(recommendation);
+                continue;
+            }
+            extraWarnings.Add(ConflictWarning(language, recommendation.ItemName, conflict));
+        }
+
+        var warnings = interpretation.Warnings
+            .Concat(extraWarnings)
+            .Append(Disclaimer(language))
+            .Select(x => DisplayText.CleanInline(x, true))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return interpretation with { Recommendations = keptRecommendations.ToArray(), Warnings = warnings };
+    }
+
+    private static string? FindConflict(MenuRecommendationDto recommendation, Dictionary<string, MenuItemDto> itemsByName, string[] blocked)
+    {
+        if (blocked.Length == 0) return null;
+        // Match against the item's own allergen/description text as well as its name.
+        var haystack = recommendation.ItemName + " " + string.Join(" ", recommendation.Warnings);
+        if (itemsByName.TryGetValue(recommendation.ItemName, out var item))
+            haystack += " " + item.Description + " " + item.Category + " " + string.Join(" ", item.PossibleAllergens);
+        return blocked.FirstOrDefault(term => haystack.Contains(term, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string ConflictWarning(string language, string itemName, string term) => language switch
+    {
+        "tr" => $"{itemName} önerilerden çıkarıldı: kayıtlı hassasiyetinle ({term}) çakışıyor görünüyor.",
+        "de" => $"{itemName} wurde aus den Vorschlägen entfernt: es scheint mit deiner gespeicherten Angabe ({term}) zu kollidieren.",
+        _ => $"{itemName} was left out of the suggestions because it looks like it conflicts with your saved note ({term})."
+    };
+
+    private static string Disclaimer(string language) => language switch
+    {
+        "tr" => "Menü bilgileri eksik veya hatalı okunmuş olabilir. Alerjin veya bir diyet kısıtın varsa sipariş vermeden önce içerikleri personele doğrulat.",
+        "de" => "Angaben auf der Speisekarte können unvollständig oder falsch gelesen sein. Bei Allergien oder Ernährungseinschränkungen bestätige die Zutaten vor dem Bestellen beim Personal.",
+        _ => "Menu details may be incomplete or misread. If you have allergies or dietary restrictions, confirm the ingredients with the staff before ordering."
+    };
+}
+
+internal sealed class MenuScanService(
+    DineCueDbContext db,
+    IObjectStorage storage,
+    IAiMenuInterpreter interpreter,
+    IMenuScanJobQueue jobQueue,
+    IQuotaService quota,
+    MenuScanProcessor processor,
+    Microsoft.Extensions.Options.IOptions<StorageOptions> storageOptions,
+    ILogger<MenuScanService> logger) : IMenuScanService
+{
+    public async Task<MenuScanAcceptedResponse> CreateAsync(Guid userId, MenuScanRequest request, CancellationToken ct)
+    {
+        var config = storageOptions.Value;
+        RequestValidation.MenuScan(request, config.EffectiveMaxImagesPerScan());
         var language = SupportedLanguages.NormalizeOrDefault(request.Language);
+        var objectNames = (request.ImageObjectNames ?? []).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.Ordinal).ToArray();
+
+        // Images must already belong to this user and not to another scan.
+        var images = objectNames.Length == 0
+            ? []
+            : await db.MenuScanImages.Where(x => x.UserId == userId && x.MenuScanId == null && objectNames.Contains(x.ObjectName)).ToListAsync(ct);
+        if (images.Count != objectNames.Length)
+            throw new ApiException("validation_error", "One or more uploaded images could not be found. Upload the menu photos again.", 400, new { field = "imageObjectNames" });
+
+        var inlineText = ResolveInlineText(request);
+        if (images.Count == 0 && string.IsNullOrWhiteSpace(inlineText))
+            throw new ApiException("validation_error", "Add at least one menu photo.", 400, new { field = "imageObjectNames" });
+
         await quota.ReserveMenuScanAsync(userId, ct);
         try
         {
-            var text = string.IsNullOrWhiteSpace(request.OcrText) ? await ocr.ExtractTextAsync(request.ImageUrl, request.ImageBase64, ct) : request.OcrText!;
-            var interpretation = await ai.InterpretAsync(text, language, request.DiningContext, ct);
-            var scan = new MenuScan { UserId = userId, RestaurantPlaceId = request.RestaurantPlaceId, ImageUrl = request.ImageUrl, OcrText = text, Language = interpretation.DetectedLanguage, DiningContextJson = JsonText.Serialize(request.DiningContext ?? new Dictionary<string, object>()), RawAiResponseJson = JsonText.Serialize(interpretation) };
+            var scan = new MenuScan
+            {
+                UserId = userId,
+                RestaurantPlaceId = request.RestaurantPlaceId,
+                OcrText = string.IsNullOrWhiteSpace(request.OcrText) ? null : request.OcrText,
+                Language = language,
+                RawTextInput = string.IsNullOrWhiteSpace(request.RawText) ? null : request.RawText!.Trim(),
+                SelectedCuesJson = JsonText.Serialize(request.SelectedCues ?? []),
+                DiningContextJson = JsonText.Serialize(request.Context ?? request.DiningContext ?? new Dictionary<string, object>()),
+                Status = "queued"
+            };
             db.MenuScans.Add(scan);
-            foreach (var item in interpretation.Items) db.MenuScanItems.Add(new MenuScanItem { MenuScanId = scan.Id, Name = item.Name, Description = item.Description, Category = item.Category, PriceText = item.PriceText, DetectedLanguage = interpretation.DetectedLanguage, PossibleAllergensJson = JsonText.Serialize(item.PossibleAllergens), IsKidFriendly = item.IsKidFriendly, IsVegetarian = item.IsVegetarian, IsSpicy = item.IsSpicy });
-            foreach (var rec in interpretation.Recommendations) db.MenuScanRecommendations.Add(new MenuScanRecommendation { MenuScanId = scan.Id, ItemName = rec.ItemName, Reason = rec.Reason, SuitabilityScore = rec.SuitabilityScore, WarningsJson = JsonText.Serialize(rec.Warnings) });
-            await events.TrackAsync(userId, new InteractionEventRequest("MenuScanCreated", "MenuScan", scan.Id.ToString(), null), ct);
+
+            var position = 0;
+            foreach (var objectName in objectNames)
+            {
+                var image = images.First(x => x.ObjectName.Equals(objectName, StringComparison.Ordinal));
+                image.MenuScanId = scan.Id;
+                image.Position = position++;
+            }
+            // A pasted base64 image is still supported and is stored the same way an upload would be.
+            if (images.Count == 0 && !string.IsNullOrWhiteSpace(request.ImageBase64))
+                await StoreInlineImageAsync(userId, scan.Id, request.ImageBase64!, ct);
+
             await db.SaveChangesAsync(ct);
-            return ToResponse(scan.Id, interpretation);
+            await jobQueue.EnqueueAsync(new MenuScanJob(scan.Id, userId), ct);
+            logger.LogInformation("Menu scan {MenuScanId} queued with {ImageCount} images", scan.Id, images.Count);
+            return new MenuScanAcceptedResponse(scan.Id, scan.Status, $"/menu-scans/{scan.Id}");
         }
-        catch
+        catch (Exception ex)
         {
+            logger.LogWarning(ex, "Menu scan create failed after quota reservation for user {UserId}. ExceptionType={ExceptionType}", userId, ex.GetType().Name);
             await quota.ReleaseMenuScanAsync(userId, ct);
             throw;
         }
     }
+
     public async Task<MenuScanResponse> GetAsync(Guid userId, Guid id, CancellationToken ct)
     {
-        var scan = await db.MenuScans.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id && x.UserId == userId, ct) ?? throw new ApiException("not_found", "Menu scan was not found.", 404);
-        return ToResponse(scan.Id, JsonText.Deserialize(scan.RawAiResponseJson, Empty(scan.Id)));
+        var scan = await db.MenuScans.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id && x.UserId == userId, ct)
+            ?? throw new ApiException("not_found", "Menu scan was not found.", 404);
+        var imageCount = await db.MenuScanImages.CountAsync(x => x.MenuScanId == scan.Id, ct);
+        return ToResponse(scan, imageCount);
     }
-    public async Task<MenuScanResponse> RecommendAsync(Guid userId, Guid id, CancellationToken ct) => await GetAsync(userId, id, ct);
-    private static MenuInterpretation Empty(Guid id) => new("en", "No interpreted menu was stored.", [], [], [], [], []);
-    private static MenuScanResponse ToResponse(Guid id, MenuInterpretation x) => new(id, x.DetectedLanguage, x.Summary, x.Sections, x.Items, x.Recommendations, x.Warnings, x.QuestionsToAskStaff);
+
+    public async Task<MenuScanResponse> RecommendAsync(Guid userId, Guid id, CancellationToken ct)
+    {
+        var scan = await db.MenuScans.FirstOrDefaultAsync(x => x.Id == id && x.UserId == userId, ct)
+            ?? throw new ApiException("not_found", "Menu scan was not found.", 404);
+        if (scan.Status != "completed" || string.IsNullOrWhiteSpace(scan.OcrText))
+            throw new ApiException("menu_scan_not_ready", "This menu is not ready yet.", 409);
+
+        // Text only: the menu was already read, so re-ranking against the current profile costs no credit.
+        var request = await processor.BuildInterpretationRequestAsync(scan, [], ct);
+        var result = await interpreter.InterpretAsync(request, ct);
+        var interpretation = MenuSafety.Apply(result.Interpretation, request.TasteProfile, scan.Language);
+
+        await processor.ClearPreviousResultsAsync(scan.Id, ct);
+        processor.PersistInterpretation(scan, interpretation, result.OcrText);
+        await db.SaveChangesAsync(ct);
+
+        var imageCount = await db.MenuScanImages.CountAsync(x => x.MenuScanId == scan.Id, ct);
+        return ToResponse(scan, imageCount);
+    }
+
+    public async Task<MenuImageUploadResponse> UploadImageAsync(Guid userId, Stream content, string? declaredContentType, string? fileName, CancellationToken ct)
+    {
+        var config = storageOptions.Value;
+        var maxBytes = config.EffectiveMaxImageBytes();
+
+        using var buffer = new MemoryStream();
+        // Read one byte past the limit so an oversized upload is rejected instead of silently truncated.
+        await CopyBoundedAsync(content, buffer, maxBytes + 1, ct);
+        if (buffer.Length == 0)
+            throw new ApiException("validation_error", "The uploaded file was empty.", 400, new { field = "file" });
+        if (buffer.Length > maxBytes)
+            throw new ApiException("image_too_large", "This photo is too large. Try a smaller or more compressed image.", 400, new { field = "file", maxBytes });
+
+        var bytes = buffer.ToArray();
+        var detected = ImageContentType.Detect(bytes.AsSpan(0, Math.Min(16, bytes.Length)));
+        if (detected == null || !config.EffectiveAllowedContentTypes().Contains(detected, StringComparer.OrdinalIgnoreCase))
+            throw new ApiException("unsupported_image_type", "Use a JPEG, PNG, or WebP photo of the menu.", 400, new { field = "file", allowed = config.EffectiveAllowedContentTypes() });
+
+        var objectName = $"{config.ObjectPrefix.Trim('/')}/{userId:N}/{Guid.NewGuid():N}.{ImageContentType.Extension(detected)}";
+        using var upload = new MemoryStream(bytes, writable: false);
+        await storage.PutAsync(objectName, upload, detected, ct);
+
+        var image = new MenuScanImage
+        {
+            UserId = userId,
+            ObjectName = objectName,
+            ContentType = detected,
+            SizeBytes = bytes.Length
+        };
+        db.MenuScanImages.Add(image);
+        await db.SaveChangesAsync(ct);
+        logger.LogInformation("Menu image uploaded for user {UserId} with {SizeBytes} bytes", userId, bytes.Length);
+        return new MenuImageUploadResponse(objectName, detected, image.SizeBytes, image.CreatedAt);
+    }
+
+    public async Task<(Stream Content, string ContentType)?> OpenImageAsync(Guid userId, Guid menuScanId, int index, CancellationToken ct)
+    {
+        // The ownership filter is the access control: object names are never exposed to clients.
+        var image = await db.MenuScanImages.AsNoTracking()
+            .Where(x => x.MenuScanId == menuScanId && x.UserId == userId)
+            .OrderBy(x => x.Position)
+            .Skip(Math.Max(0, index))
+            .FirstOrDefaultAsync(ct);
+        if (image == null) return null;
+        var content = await storage.OpenReadAsync(image.ObjectName, ct);
+        return content == null ? null : (content, image.ContentType);
+    }
+
+    private async Task StoreInlineImageAsync(Guid userId, Guid menuScanId, string imageBase64, CancellationToken ct)
+    {
+        var payload = imageBase64.Contains(",", StringComparison.Ordinal) ? imageBase64[(imageBase64.IndexOf(',') + 1)..] : imageBase64;
+        byte[] bytes;
+        try
+        {
+            bytes = Convert.FromBase64String(payload.Trim());
+        }
+        catch (FormatException)
+        {
+            throw new ApiException("validation_error", "imageBase64 is not valid base64 content.", 400, new { field = "imageBase64" });
+        }
+
+        var config = storageOptions.Value;
+        if (bytes.Length > config.EffectiveMaxImageBytes())
+            throw new ApiException("image_too_large", "This photo is too large. Try a smaller or more compressed image.", 400, new { field = "imageBase64" });
+        var detected = ImageContentType.Detect(bytes.AsSpan(0, Math.Min(16, bytes.Length)));
+        if (detected == null || !config.EffectiveAllowedContentTypes().Contains(detected, StringComparer.OrdinalIgnoreCase))
+            throw new ApiException("unsupported_image_type", "Use a JPEG, PNG, or WebP photo of the menu.", 400, new { field = "imageBase64" });
+
+        var objectName = $"{config.ObjectPrefix.Trim('/')}/{userId:N}/{Guid.NewGuid():N}.{ImageContentType.Extension(detected)}";
+        using var upload = new MemoryStream(bytes, writable: false);
+        await storage.PutAsync(objectName, upload, detected, ct);
+        db.MenuScanImages.Add(new MenuScanImage
+        {
+            UserId = userId,
+            MenuScanId = menuScanId,
+            ObjectName = objectName,
+            ContentType = detected,
+            SizeBytes = bytes.Length,
+            Position = 0
+        });
+    }
+
+    /// <summary>
+    /// Copies at most <paramref name="limit"/> bytes. The caller passes one byte more than the real maximum
+    /// and compares the result, so an oversized upload is rejected rather than silently truncated.
+    /// </summary>
+    private static async Task CopyBoundedAsync(Stream source, Stream destination, long limit, CancellationToken ct)
+    {
+        var buffer = new byte[81920];
+        int read;
+        while (destination.Length < limit && (read = await source.ReadAsync(buffer, ct)) > 0)
+        {
+            var writable = (int)Math.Min(read, limit - destination.Length);
+            await destination.WriteAsync(buffer.AsMemory(0, writable), ct);
+        }
+    }
+
+    private static string? ResolveInlineText(MenuScanRequest request) =>
+        !string.IsNullOrWhiteSpace(request.OcrText) ? request.OcrText
+        : !string.IsNullOrWhiteSpace(request.ImageBase64) ? request.ImageBase64
+        : null;
+
+    private static MenuScanResponse ToResponse(MenuScan scan, int imageCount)
+    {
+        var interpretation = JsonText.Deserialize(scan.RawAiResponseJson, EmptyInterpretation(scan.Language));
+        return new MenuScanResponse(
+            scan.Id,
+            interpretation.DetectedLanguage,
+            interpretation.Summary,
+            interpretation.Sections,
+            interpretation.Items,
+            interpretation.Recommendations,
+            interpretation.Warnings,
+            interpretation.QuestionsToAskStaff,
+            scan.Status,
+            scan.CurrentStep,
+            scan.ErrorCode,
+            scan.ErrorMessage,
+            scan.CreatedAt,
+            scan.CompletedAt,
+            imageCount,
+            scan.RestaurantPlaceId);
+    }
+
+    private static MenuInterpretation EmptyInterpretation(string language) =>
+        new(language, "", [], [], [], [], []);
 }
 
 internal sealed class InteractionEventService(DineCueDbContext db) : IInteractionEventService
@@ -3018,20 +4607,209 @@ internal sealed class MockLocationResolver : ILocationResolver
 
 internal sealed class MockWeatherProvider : IWeatherProvider
 {
-    public Task<WeatherContext> GetCurrentAsync(double latitude, double longitude, CancellationToken cancellationToken) =>
+    public Task<WeatherContext> GetCurrentAsync(double? latitude, double? longitude, CancellationToken cancellationToken) =>
         Task.FromResult(new WeatherContext("Clear and warm", 27, "Outdoor seating is likely comfortable; shaded terraces are a plus."));
 }
 
-internal sealed class MockRouteProvider : IRouteProvider
+/// <summary>
+/// Builds genuine Google Maps directions URLs. Nothing here is mocked, so it is registered in every environment.
+/// </summary>
+internal sealed class GoogleMapsRouteProvider : IRouteProvider
 {
     public Task<string> CreateRouteUrlAsync(double fromLat, double fromLng, double toLat, double toLng, CancellationToken cancellationToken) =>
-        Task.FromResult($"https://www.google.com/maps/dir/?api=1&origin={fromLat},{fromLng}&destination={toLat},{toLng}");
+        Task.FromResult(FormattableString.Invariant($"https://www.google.com/maps/dir/?api=1&origin={fromLat},{fromLng}&destination={toLat},{toLng}"));
+
+    public Task<string> CreateDestinationUrlAsync(string destinationName, string? destinationPlaceId, double toLat, double toLng, CancellationToken cancellationToken)
+    {
+        var url = FormattableString.Invariant($"https://www.google.com/maps/dir/?api=1&destination={toLat},{toLng}");
+        if (!string.IsNullOrWhiteSpace(destinationPlaceId))
+            url += "&destination_place_id=" + Uri.EscapeDataString(destinationPlaceId);
+        return Task.FromResult(url);
+    }
 }
 
-internal sealed class MockMenuOcrProvider : IMenuOcrProvider
+/// <summary>
+/// Reads menu photos and structures them for one diner in a single OpenAI vision call. Doing transcription
+/// and interpretation together halves both cost and latency, and the transcript comes back so a later
+/// re-ranking against the diner's current profile never has to read the images again.
+/// Safety rules (allergen disclaimer, conflicting-item removal) are enforced afterwards by <see cref="MenuSafety"/>.
+/// </summary>
+internal sealed class OpenAiMenuInterpreter(
+    OpenAiJsonClient client,
+    ILogger<OpenAiMenuInterpreter> logger) : IAiMenuInterpreter
 {
-    public Task<string> ExtractTextAsync(string? imageUrl, string? imageBase64, CancellationToken cancellationToken) =>
-        Task.FromResult("Lentil soup, grilled sea bass, chicken skewers, tomato pasta, pistachio baklava, ayran");
+    private const string ErrorCode = "menu_provider_failed";
+    private const string ClientMessage = "We could not read this menu right now.";
+
+    private const string SystemPrompt = "You are DineCue's dining assistant reading a restaurant menu for one specific diner. Return only valid JSON. Transcribe what is actually printed on the menu into ocrText. Never invent dishes, prices, ingredients, or allergens that are not visible. If a price is not legible, return null for priceText instead of guessing. Treat allergen fields as possibilities inferred from the dish name and description, never as guarantees. Write every user-facing field in the requested language, warmly and concisely, as if speaking directly to the diner. Never use backend, provider, or analysis language. If the images are not a readable menu, set readable to false and leave the lists empty. Supported languages: en, de, tr.";
+
+    private static readonly object ResponseSchema = JsonSchema.Object(
+        ("readable", JsonSchema.Bool()),
+        ("detectedLanguage", JsonSchema.Enum("en", "de", "tr")),
+        ("ocrText", JsonSchema.Text()),
+        ("summary", JsonSchema.Text()),
+        ("sections", JsonSchema.List(JsonSchema.Object(
+            ("name", JsonSchema.Text()),
+            ("itemNames", JsonSchema.List(JsonSchema.Text()))))),
+        ("items", JsonSchema.List(JsonSchema.Object(
+            ("name", JsonSchema.Text()),
+            ("description", JsonSchema.Text()),
+            ("category", JsonSchema.Text()),
+            ("priceText", JsonSchema.NullableText()),
+            ("possibleAllergens", JsonSchema.List(JsonSchema.Text())),
+            ("isKidFriendly", JsonSchema.Bool()),
+            ("isVegetarian", JsonSchema.Bool()),
+            ("isSpicy", JsonSchema.Bool())))),
+        ("recommendedItems", JsonSchema.List(JsonSchema.Object(
+            ("itemName", JsonSchema.Text()),
+            ("reason", JsonSchema.Text()),
+            ("suitabilityScore", JsonSchema.Number()),
+            ("warnings", JsonSchema.List(JsonSchema.Text()))))),
+        ("warnings", JsonSchema.List(JsonSchema.Text())),
+        ("questionsToAskStaff", JsonSchema.List(JsonSchema.Text())));
+
+    public async Task<MenuInterpretationResult> InterpretAsync(MenuInterpretationRequest request, CancellationToken cancellationToken)
+    {
+        var json = await client.CompleteAsync(
+            new OpenAiJsonRequest(
+                ErrorCode,
+                ClientMessage,
+                SystemPrompt,
+                BuildPrompt(request),
+                "dinecue_menu_scan",
+                ResponseSchema,
+                // A full menu transcript plus structured items is the largest output in the app.
+                MaxOutputTokens: 6000,
+                ImageDataUrls: request.ImageDataUrls,
+                UseVisionModel: request.ImageDataUrls.Count > 0),
+            cancellationToken);
+
+        var readable = GooglePlacesApi.ReadBool(json["readable"]) ?? true;
+        var items = ReadItems(json["items"]);
+        var interpretation = new MenuInterpretation(
+            SupportedLanguages.NormalizeOrDefault(json["detectedLanguage"]?.GetValue<string>()),
+            DisplayText.CleanInline(json["summary"]?.GetValue<string>() ?? "", true),
+            ReadSections(json["sections"]),
+            items,
+            ReadRecommendations(json["recommendedItems"], items),
+            ReadTextList(json["warnings"]),
+            ReadTextList(json["questionsToAskStaff"]));
+        var ocrText = json["ocrText"]?.GetValue<string>() ?? "";
+
+        if (!readable || (items.Length == 0 && string.IsNullOrWhiteSpace(ocrText)))
+        {
+            logger.LogInformation("Menu scan images were not readable as a menu.");
+            return new MenuInterpretationResult(ocrText, interpretation, Readable: false);
+        }
+        return new MenuInterpretationResult(ocrText, interpretation, Readable: true);
+    }
+
+    internal static string BuildPrompt(MenuInterpretationRequest request)
+    {
+        var prompt = new
+        {
+            instruction = request.ImageDataUrls.Count > 0
+                ? "Read every attached menu photo. They are pages of the same menu, so merge them into one set of sections and items without duplicating dishes. Then recommend the dishes that fit this diner."
+                : "Use the supplied menu text. Do not add dishes that are not in it. Then recommend the dishes that fit this diner. Return the same text back in ocrText.",
+            copyRules = new
+            {
+                summary = "One or two natural sentences about what this menu offers for this diner. Speak directly to them.",
+                reason = "Say why the dish suits this diner in one short natural sentence. Reference their stated needs, not internal data.",
+                warnings = "Honest, useful cautions only. Say allergens are possible, not certain.",
+                questionsToAskStaff = "Concrete questions worth asking at the table, especially about allergens and preparation.",
+                prices = "Copy prices exactly as printed, including the currency symbol. Use null when unreadable.",
+                suitabilityScore = "A number between 0 and 1, where 1 means an excellent fit for this diner."
+            },
+            bannedUiPhrases = DisplayText.ForbiddenPhrases,
+            language = request.Language,
+            // The diner's durable context. This is why they never have to retype their allergies.
+            diner = new
+            {
+                allergies = request.TasteProfile?.Allergies ?? [],
+                dietaryRestrictions = request.TasteProfile?.DietaryRestrictions ?? [],
+                dislikedIngredients = request.TasteProfile?.DislikedIngredients ?? [],
+                dislikedCuisines = request.TasteProfile?.DislikedCuisines ?? [],
+                favoriteCuisines = request.TasteProfile?.FavoriteCuisines ?? [],
+                favoriteDishes = request.TasteProfile?.FavoriteDishes ?? [],
+                spiceTolerance = request.TasteProfile?.SpiceTolerance,
+                sweetSaltyPreference = request.TasteProfile?.SweetSaltyPreference,
+                drinkPreferences = request.TasteProfile?.DrinkPreferences ?? [],
+                usuallyWithKids = request.DiningProfile?.UsuallyWithKids,
+                budgetSensitivity = request.DiningProfile?.BudgetSensitivity
+            },
+            // The moment-specific layer, all optional.
+            moment = new
+            {
+                note = request.RawText,
+                cues = request.SelectedCues,
+                context = request.Context
+            },
+            hardRules = new[]
+            {
+                "Never recommend a dish that conflicts with a listed allergy or dietary restriction.",
+                "Flag every recommended dish that may contain a listed allergen, even if you still recommend it.",
+                "Do not invent dishes, prices, or ingredients."
+            },
+            restaurantMetadata = string.IsNullOrWhiteSpace(request.RestaurantMetadataJson)
+                ? null
+                : JsonText.Deserialize(request.RestaurantMetadataJson, new Dictionary<string, object>()),
+            menuText = request.Text
+        };
+        return JsonText.Serialize(prompt);
+    }
+
+    private static MenuSectionDto[] ReadSections(JsonNode? node) =>
+        node is not JsonArray array
+            ? []
+            : array
+                .Select(x => new MenuSectionDto(
+                    DisplayText.CleanInline(x?["name"]?.GetValue<string>() ?? "", false),
+                    GooglePlacesApi.ReadStringArray(x?["itemNames"])))
+                .Where(x => !string.IsNullOrWhiteSpace(x.Name))
+                .ToArray();
+
+    private static MenuItemDto[] ReadItems(JsonNode? node) =>
+        node is not JsonArray array
+            ? []
+            : array
+                .Select(x => new MenuItemDto(
+                    DisplayText.CleanInline(x?["name"]?.GetValue<string>() ?? "", false),
+                    DisplayText.CleanInline(x?["description"]?.GetValue<string>() ?? "", true),
+                    DisplayText.CleanInline(x?["category"]?.GetValue<string>() ?? "", false),
+                    NullableText(x?["priceText"]),
+                    GooglePlacesApi.ReadStringArray(x?["possibleAllergens"]),
+                    GooglePlacesApi.ReadBool(x?["isKidFriendly"]) ?? false,
+                    GooglePlacesApi.ReadBool(x?["isVegetarian"]) ?? false,
+                    GooglePlacesApi.ReadBool(x?["isSpicy"]) ?? false))
+                .Where(x => !string.IsNullOrWhiteSpace(x.Name))
+                .ToArray();
+
+    private static MenuRecommendationDto[] ReadRecommendations(JsonNode? node, MenuItemDto[] items)
+    {
+        if (node is not JsonArray array) return [];
+        var itemNames = items.Select(x => x.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return array
+            .Select(x => new MenuRecommendationDto(
+                DisplayText.CleanInline(x?["itemName"]?.GetValue<string>() ?? "", false),
+                DisplayText.CleanInline(x?["reason"]?.GetValue<string>() ?? "", true),
+                Math.Clamp(GooglePlacesApi.ReadDouble(x?["suitabilityScore"]) ?? 0.5, 0, 1),
+                ReadTextList(x?["warnings"])))
+            // A recommended dish that is not on the menu we just read would be a hallucination.
+            .Where(x => !string.IsNullOrWhiteSpace(x.ItemName) && (itemNames.Count == 0 || itemNames.Contains(x.ItemName)))
+            .ToArray();
+    }
+
+    private static string[] ReadTextList(JsonNode? node) =>
+        GooglePlacesApi.ReadStringArray(node)
+            .Select(x => DisplayText.CleanInline(x, true))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToArray();
+
+    private static string? NullableText(JsonNode? node)
+    {
+        var value = node is JsonValue json && json.TryGetValue<string>(out var text) ? text : null;
+        return string.IsNullOrWhiteSpace(value) ? null : DisplayText.CleanInline(value, false);
+    }
 }
 
 internal sealed class MockAiIntentParser : IAiIntentParser
@@ -3135,10 +4913,199 @@ internal sealed class MockReservationLinkResolver : IReservationLinkResolver
     }
 }
 
+/// <summary>
+/// Answers "does this specific place suit this moment?" from provider-reported attributes crossed with the
+/// diner's stored profile and the moment they described. Shares the copy rules and grounding constraints of
+/// the recommendation reasoner, so it can only claim what Places actually reports.
+/// </summary>
+internal sealed class OpenAiRestaurantFitAnalyzer(
+    OpenAiJsonClient client,
+    ILogger<OpenAiRestaurantFitAnalyzer> logger) : IAiRestaurantFitAnalyzer
+{
+    private const string ErrorCode = "fit_provider_failed";
+    private const string ClientMessage = "We could not check this place right now.";
+    private const int SemanticAttempts = 2;
+
+    private const string SystemPrompt = "You are DineCue's dining assistant judging whether one specific restaurant suits one specific moment. Return only valid JSON. Base every claim on the supplied restaurant metadata and the diner's profile. Do not invent opening hours, menus, prices, reservation availability, or amenities. If metadata does not cover something the diner cares about, put it in cons or in questionsToAsk instead of guessing. Write warmly, concisely, and directly to the diner, ready to display in a UI. Never use backend, provider, or analysis language. When certainty is limited use soft wording: görünüyor, olabilir, kontrol etmek iyi olur, looks like, may be, worth checking, wirkt, könnte, es wäre gut zu prüfen. Supported languages: en, de, tr.";
+
+    private static readonly object ResponseSchema = JsonSchema.Object(
+        ("fitScore", JsonSchema.Integer()),
+        ("verdict", JsonSchema.Text()),
+        ("summary", JsonSchema.Text()),
+        ("pros", JsonSchema.List(JsonSchema.Text())),
+        ("cons", JsonSchema.List(JsonSchema.Text())),
+        ("questionsToAsk", JsonSchema.List(JsonSchema.Text())),
+        ("confidence", JsonSchema.Number()),
+        ("reservationAdvice", JsonSchema.Text()),
+        ("relevantSignals", JsonSchema.List(JsonSchema.Object(
+            ("signal", JsonSchema.Text()),
+            ("value", JsonSchema.Text()),
+            ("impact", JsonSchema.Enum("positive", "negative", "neutral"))))));
+
+    public async Task<RestaurantFitCheckResponse> AnalyzeAsync(RestaurantFitContext context, CancellationToken cancellationToken)
+    {
+        Exception? lastError = null;
+        string? repairFeedback = null;
+        for (var attempt = 0; attempt < SemanticAttempts; attempt++)
+        {
+            try
+            {
+                var json = await client.CompleteAsync(
+                    new OpenAiJsonRequest(
+                        ErrorCode,
+                        ClientMessage,
+                        SystemPrompt,
+                        BuildPrompt(context, repairFeedback),
+                        "dinecue_fit_check",
+                        ResponseSchema,
+                        MaxOutputTokens: 1600),
+                    cancellationToken);
+                return Parse(json, context.Reservation);
+            }
+            catch (ProviderFailureException ex) when (!string.IsNullOrWhiteSpace(ex.RepairFeedback))
+            {
+                lastError = ex;
+                repairFeedback = ex.RepairFeedback;
+                logger.LogWarning("Fit check output failed validation on attempt {Attempt}; asking for a repair.", attempt + 1);
+            }
+            catch (ProviderFailureException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                lastError = ex;
+                repairFeedback = "The previous response could not be read as the required JSON object. Return valid JSON that matches the schema exactly.";
+                logger.LogWarning(ex, "Fit check output could not be parsed on attempt {Attempt}.", attempt + 1);
+            }
+        }
+
+        logger.LogWarning(lastError, "Fit check failed after {Attempts} attempts.", SemanticAttempts);
+        throw new ProviderFailureException(ErrorCode, ClientMessage, lastError);
+    }
+
+    internal static string BuildPrompt(RestaurantFitContext context, string? repairFeedback)
+    {
+        var place = context.Restaurant;
+        var prompt = new
+        {
+            instruction = "Decide how well this restaurant fits the described moment for this diner. fitScore is 0-100. confidence is 0-1 and should drop when the metadata is thin. Every pro and con must trace back to supplied metadata or to what the diner told you.",
+            repairFeedback,
+            copyRules = new
+            {
+                verdict = "A short natural label such as a good fit, worth a look, or probably not tonight. Localize it.",
+                summary = "Two or three sentences answering the question directly, as if talking to the diner.",
+                pros = "Concrete, grounded reasons this works. 1-4 items.",
+                cons = "Honest reasons it might not, including anything the metadata does not tell us. 1-4 items.",
+                questionsToAsk = "Questions worth asking the restaurant before or on arrival. 1-4 items.",
+                reservationAdvice = "One sentence of practical advice based only on the reservation fields supplied.",
+                relevantSignals = "The specific signals that moved the score, with the value you relied on."
+            },
+            bannedUiPhrases = DisplayText.ForbiddenPhrases,
+            language = context.Request.Language ?? SupportedLanguages.Default,
+            restaurant = new
+            {
+                place.Name,
+                place.Address,
+                place.Rating,
+                place.RatingCount,
+                place.PriceLevel,
+                metadata = JsonText.Deserialize(place.RawPayloadJson, new Dictionary<string, object>())
+            },
+            reservation = context.Reservation,
+            moment = new
+            {
+                note = context.Request.RawText,
+                context = context.Request.Context,
+                // An explicit intended time makes the opening-hours metadata actionable.
+                visitAt = context.VisitAt?.ToString("O", CultureInfo.InvariantCulture)
+            },
+            diner = new
+            {
+                allergies = context.TasteProfile?.Allergies ?? [],
+                dietaryRestrictions = context.TasteProfile?.DietaryRestrictions ?? [],
+                dislikedCuisines = context.TasteProfile?.DislikedCuisines ?? [],
+                favoriteCuisines = context.TasteProfile?.FavoriteCuisines ?? [],
+                spiceTolerance = context.TasteProfile?.SpiceTolerance,
+                usuallyWithKids = context.DiningProfile?.UsuallyWithKids,
+                prefersQuietPlaces = context.DiningProfile?.PrefersQuietPlaces,
+                prefersOutdoor = context.DiningProfile?.PrefersOutdoor,
+                budgetSensitivity = context.DiningProfile?.BudgetSensitivity,
+                likesPremiumPlaces = context.DiningProfile?.LikesPremiumPlaces,
+                needsParking = context.DiningProfile?.NeedsParking,
+                needsAccessibility = context.DiningProfile?.NeedsAccessibility
+            },
+            hardRules = new[]
+            {
+                "If openingPeriods or openingHours do not cover the intended visit time, say so in cons.",
+                "Do not claim the place is quiet, family-friendly, reservable, or accessible unless metadata says so.",
+                "Do not describe menu items; you have not seen the menu."
+            }
+        };
+        return JsonText.Serialize(prompt);
+    }
+
+    private static RestaurantFitCheckResponse Parse(JsonNode json, ReservationDto reservation)
+    {
+        var fitScore = GooglePlacesApi.ReadInt(json["fitScore"]);
+        if (fitScore is null or < 0 or > 100)
+            throw RepairNeeded($"fitScore was '{json["fitScore"]}' but must be an integer between 0 and 100.");
+        var confidence = GooglePlacesApi.ReadDouble(json["confidence"]);
+        if (confidence is null or < 0 or > 1)
+            throw RepairNeeded($"confidence was '{json["confidence"]}' but must be a number between 0 and 1.");
+        var verdict = DisplayText.CleanInline(json["verdict"]?.GetValue<string>() ?? "", false);
+        if (string.IsNullOrWhiteSpace(verdict))
+            throw RepairNeeded("verdict was empty. Return a short natural label in the requested language.");
+
+        return new RestaurantFitCheckResponse(
+            fitScore.Value,
+            verdict,
+            DisplayText.CleanInline(json["summary"]?.GetValue<string>() ?? "", true),
+            ReadTextList(json["pros"]),
+            ReadTextList(json["cons"]),
+            ReadTextList(json["questionsToAsk"]),
+            confidence.Value,
+            ReadSignals(json["relevantSignals"]),
+            DisplayText.CleanInline(json["reservationAdvice"]?.GetValue<string>() ?? "", true),
+            reservation);
+    }
+
+    /// <summary>Flattens the signal list into the dictionary shape the response contract already uses.</summary>
+    private static Dictionary<string, object> ReadSignals(JsonNode? node)
+    {
+        var signals = new Dictionary<string, object>(StringComparer.Ordinal);
+        if (node is not JsonArray array) return signals;
+        foreach (var entry in array)
+        {
+            var name = entry?["signal"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            signals[name!] = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["value"] = entry?["value"]?.GetValue<string>() ?? "",
+                ["impact"] = entry?["impact"]?.GetValue<string>() ?? "neutral"
+            };
+        }
+        return signals;
+    }
+
+    private static string[] ReadTextList(JsonNode? node) =>
+        GooglePlacesApi.ReadStringArray(node)
+            .Select(x => DisplayText.CleanInline(x, true))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToArray();
+
+    private static ProviderFailureException RepairNeeded(string detail) =>
+        new(ErrorCode, ClientMessage, repairFeedback:
+            detail + " Fix only this problem and keep the same JSON shape.");
+}
+
 internal sealed class MockAiRestaurantFitAnalyzer : IAiRestaurantFitAnalyzer
 {
-    public Task<RestaurantFitCheckResponse> AnalyzeAsync(PlaceCandidate restaurant, RestaurantFitCheckRequest request, ReservationDto reservation, CancellationToken cancellationToken)
+    public Task<RestaurantFitCheckResponse> AnalyzeAsync(RestaurantFitContext context, CancellationToken cancellationToken)
     {
+        var restaurant = context.Restaurant;
+        var request = context.Request;
+        var reservation = context.Reservation;
         var text = request.RawText?.ToLowerInvariant() ?? "";
         var family = text.Contains("kid") || text.Contains("family");
         var score = restaurant.ProviderPlaceId.Contains("garden") ? 86 : family ? 76 : 82;
@@ -3158,8 +5125,9 @@ internal sealed class MockAiRestaurantFitAnalyzer : IAiRestaurantFitAnalyzer
 
 internal sealed class MockAiMenuInterpreter : IAiMenuInterpreter
 {
-    public Task<MenuInterpretation> InterpretAsync(string text, string language, Dictionary<string, object>? diningContext, CancellationToken cancellationToken)
+    public Task<MenuInterpretationResult> InterpretAsync(MenuInterpretationRequest request, CancellationToken cancellationToken)
     {
+        var language = request.Language;
         var items = new[]
         {
             new MenuItemDto("Lentil soup", "Comforting red lentil soup with lemon.", "Starters", "120 TRY", [], true, true, false),
@@ -3180,13 +5148,17 @@ internal sealed class MockAiMenuInterpreter : IAiMenuInterpreter
             new MenuSectionDto("Mains", ["Grilled sea bass", "Chicken skewers", "Tomato pasta"]),
             new MenuSectionDto("Desserts", ["Pistachio baklava"])
         };
-        return Task.FromResult(new MenuInterpretation(
+        var interpretation = new MenuInterpretation(
             language,
             "Mock menu interpretation found simple family-friendly dishes, vegetarian options, and common allergen signals.",
             sections,
             items,
             recs,
             ["Menu information may be incomplete or inaccurate. If you have allergies or dietary restrictions, confirm ingredients with the restaurant staff before ordering."],
-            ["Can you confirm allergens for this dish?", "Is this cooked separately from seafood or nuts?", "Can spice level be adjusted?"]));
+            ["Can you confirm allergens for this dish?", "Is this cooked separately from seafood or nuts?", "Can spice level be adjusted?"]);
+        var ocrText = string.IsNullOrWhiteSpace(request.Text)
+            ? "Lentil soup, grilled sea bass, chicken skewers, tomato pasta, pistachio baklava, ayran"
+            : request.Text!;
+        return Task.FromResult(new MenuInterpretationResult(ocrText, interpretation, Readable: true));
     }
 }

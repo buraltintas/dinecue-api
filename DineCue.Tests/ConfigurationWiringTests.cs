@@ -124,6 +124,81 @@ public sealed class ConfigurationWiringTests
     }
 
     [Fact]
+    public void StorageOptions_BindAndClampToSafeValues()
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Storage:Enabled"] = "true",
+                ["Storage:Bucket"] = "dinecue-menu-images",
+                ["Storage:ObjectPrefix"] = "menu-scans",
+                ["Storage:MaxImagesPerScan"] = "99",
+                ["Storage:MaxImageBytes"] = "1",
+                ["Storage:AllowedContentTypes:0"] = "image/jpeg"
+            })
+            .Build();
+
+        var options = config.GetSection("Storage").Get<StorageOptions>();
+
+        Assert.NotNull(options);
+        Assert.True(options.Enabled);
+        Assert.Equal("dinecue-menu-images", options.Bucket);
+        // Configuring the list narrows it; it must not be appended to the built-in defaults.
+        Assert.Equal(["image/jpeg"], options.EffectiveAllowedContentTypes());
+        Assert.Equal(
+            ["image/jpeg", "image/png", "image/webp"],
+            new StorageOptions().EffectiveAllowedContentTypes());
+        // Misconfiguration must not turn into an unbounded vision bill or a useless byte limit.
+        Assert.Equal(6, options.EffectiveMaxImagesPerScan());
+        Assert.Equal(64 * 1024, options.EffectiveMaxImageBytes());
+    }
+
+    [Fact]
+    public void StorageConfigValidation_FailsWhenEnabledWithoutABucket()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        var config = BaseConfig(new Dictionary<string, string?>
+        {
+            ["GoogleAuth:Enabled"] = "true",
+            ["GoogleAuth:ClientId"] = "client-1",
+            ["Storage:Enabled"] = "true",
+            ["Storage:Bucket"] = ""
+        });
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            services.AddDineCueInfrastructure(config, new TestEnvironment(Environments.Production)));
+
+        Assert.Contains("Storage:Bucket", error.Message);
+    }
+
+    [Fact]
+    public void DependencyInjection_UsesInProcessStorageWhenStorageIsDisabled()
+    {
+        // Menu scanning must degrade to a local no-op rather than break the recommendation flow.
+        var services = new ServiceCollection();
+        services.AddLogging();
+        var config = BaseConfig(new Dictionary<string, string?>
+        {
+            ["GoogleAuth:Enabled"] = "true",
+            ["GoogleAuth:ClientId"] = "client-1",
+            ["Storage:Enabled"] = "false"
+        });
+
+        services.AddDineCueInfrastructure(config, new TestEnvironment(Environments.Production));
+        using var provider = services.BuildServiceProvider();
+
+        Assert.IsType<InMemoryObjectStorage>(provider.GetRequiredService<IObjectStorage>());
+    }
+
+    [Fact]
+    public void OpenAIOptions_FallBackToTheMainModelForVisionCalls()
+    {
+        Assert.Equal("gpt-4.1-mini", new OpenAIOptions { Model = "gpt-4.1-mini" }.EffectiveVisionModel());
+        Assert.Equal("gpt-4.1", new OpenAIOptions { Model = "gpt-4.1-mini", VisionModel = "gpt-4.1" }.EffectiveVisionModel());
+    }
+
+    [Fact]
     public void AuthContracts_RemainCompatible()
     {
         var request = new GoogleLoginRequest("credential", "tr");
@@ -150,6 +225,40 @@ public sealed class ConfigurationWiringTests
         {
             RequestValidation.Recommendation(new RecommendationSessionRequest("Dinner", location, [], "en", null));
         }
+    }
+
+    /// <summary>
+    /// Pins the fields the dinecue-ui reads. Adding fields is fine (TypeScript ignores extras), but renaming
+    /// or retyping one of these silently breaks the live UI, so this test fails first instead.
+    /// </summary>
+    [Theory]
+    [InlineData(typeof(RecommendationCardDto), "Id:Guid,Rank:Int32,Title:String,Headline:String,PlaceName:String,Address:String,Vibe:String,Summary:String,WhyThisPlace:String,WhatToOrder:String[],GoodToKnow:String,Cautions:String[],Confidence:Double,Reservation:ReservationDto,RouteUrl:String,ShareText:String")]
+    [InlineData(typeof(ReservationDto), "Status:String,Provider:String,Url:String,PhoneNumber:String,Confidence:Double")]
+    [InlineData(typeof(RecommendationSessionDetailResponse), "SessionId:Guid,Status:String,CurrentStep:String,RawText:String,Language:String,LocationMode:String,LocationText:String,CreatedAt:DateTimeOffset,StartedAt:Nullable`1,CompletedAt:Nullable`1,FailedAt:Nullable`1,ErrorCode:String,ErrorMessage:String,NormalizedContext:Dictionary`2,Assumptions:Dictionary`2,Recommendations:IReadOnlyList`1")]
+    [InlineData(typeof(RecommendationSessionAcceptedResponse), "SessionId:Guid,Status:String,StatusUrl:String")]
+    [InlineData(typeof(SavedPlaceDto), "Id:Guid,Provider:String,ProviderPlaceId:String,RecommendationResultId:Nullable`1,Name:String,Address:String,Note:String,CreatedAt:DateTimeOffset")]
+    [InlineData(typeof(HistoryItemDto), "SessionId:Guid,RawText:String,LocationMode:String,LocationText:String,CreatedAt:DateTimeOffset,Results:IReadOnlyList`1")]
+    [InlineData(typeof(ProfileQuotaDto), "Plan:String,MonthlyLimit:Int32,UsedThisPeriod:Int32,RemainingThisPeriod:Int32,PeriodKey:String,PeriodEndsAt:DateTimeOffset,ProAvailable:Boolean,ProStatus:String")]
+    [InlineData(typeof(QuotaStateResponse), "Plan:String,MonthlyLimit:Int32,UsedThisPeriod:Int32,RemainingThisPeriod:Int32,PeriodKey:String,PeriodEndsAt:DateTimeOffset,ProAvailable:Boolean,ProStatus:String")]
+    public void UiFacingContracts_KeepTheirExistingFieldNamesAndTypes(Type contract, string requiredMembers)
+    {
+        var actual = contract.GetProperties().ToDictionary(x => x.Name, x => x.PropertyType.Name, StringComparer.Ordinal);
+
+        foreach (var member in requiredMembers.Split(','))
+        {
+            var parts = member.Split(':');
+            Assert.True(actual.ContainsKey(parts[0]), $"{contract.Name}.{parts[0]} is missing; the UI reads it.");
+            Assert.Equal(parts[1], actual[parts[0]]);
+        }
+    }
+
+    [Fact]
+    public void RecommendationCard_ExposesTheProviderPlaceIdNeededToStartAFitCheck()
+    {
+        // Fit check is addressed by Google place id, and the card is where the UI starts that flow.
+        var properties = typeof(RecommendationCardDto).GetProperties().Select(x => x.Name).ToArray();
+
+        Assert.Contains("ProviderPlaceId", properties);
     }
 
     [Fact]

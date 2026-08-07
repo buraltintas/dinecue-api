@@ -89,6 +89,7 @@ public sealed record RecommendationCardDto(
     string Headline,
     string PlaceName,
     string Address,
+    string ProviderPlaceId,
     string Vibe,
     string Summary,
     string WhyThisPlace,
@@ -101,14 +102,72 @@ public sealed record RecommendationCardDto(
     string ShareText);
 public sealed record ReservationDto(string Status, string Provider, string? Url, string? PhoneNumber, double Confidence);
 
-public sealed record RestaurantSearchRequest(string Query, LocationInput? Location, string? Language);
+/// <summary>
+/// Restaurant lookup by name. <paramref name="Cues"/> currently understands "nearby", which ranks by
+/// distance instead of rating so a diner can ask about the place in front of them.
+/// </summary>
+public sealed record RestaurantSearchRequest(string Query, LocationInput? Location, string? Language, string[]? Cues = null);
 public sealed record RestaurantSearchResultDto(string Provider, string ProviderPlaceId, string Name, string Address, double Latitude, double Longitude, decimal? Rating, int? RatingCount, int? PriceLevel, ReservationDto Reservation);
 public sealed record RestaurantDetailsDto(string Provider, string ProviderPlaceId, string Name, string Address, double Latitude, double Longitude, decimal? Rating, int? RatingCount, int? PriceLevel, string? WebsiteUrl, string? GoogleMapsUri, string? PhoneNumber, ReservationDto Reservation);
 public sealed record RestaurantFitCheckRequest(string? RawText, string? Language, Dictionary<string, object>? Context);
 public sealed record RestaurantFitCheckResponse(int FitScore, string Verdict, string Summary, string[] Pros, string[] Cons, string[] QuestionsToAsk, double Confidence, Dictionary<string, object> RelevantSignals, string ReservationAdvice, ReservationDto Reservation);
 
-public sealed record MenuScanRequest(string? ImageUrl, string? ImageBase64, string? OcrText, string? RestaurantPlaceId, string? Language, Dictionary<string, object>? DiningContext);
-public sealed record MenuScanResponse(Guid MenuScanId, string DetectedLanguage, string Summary, MenuSectionDto[] Sections, MenuItemDto[] Items, MenuRecommendationDto[] RecommendedItems, string[] Warnings, string[] QuestionsToAskStaff);
+/// <summary>
+/// A menu scan request. Images are uploaded first through POST /uploads/menu-images (which costs no credits)
+/// and referenced here by object name. The context fields mirror the find form's vocabulary, and all of them
+/// are optional because the diner's stored taste and dining profiles already carry the durable context.
+/// </summary>
+public sealed record MenuScanRequest(
+    string? ImageUrl,
+    string? ImageBase64,
+    string? OcrText,
+    string? RestaurantPlaceId,
+    string? Language,
+    Dictionary<string, object>? DiningContext,
+    string[]? ImageObjectNames = null,
+    string? RawText = null,
+    string[]? SelectedCues = null,
+    Dictionary<string, object>? Context = null);
+
+public sealed record MenuScanAcceptedResponse(Guid MenuScanId, string Status, string StatusUrl);
+public sealed record MenuImageUploadResponse(string ObjectName, string ContentType, long SizeBytes, DateTimeOffset UploadedAt);
+public sealed record MenuScanResponse(
+    Guid MenuScanId,
+    string DetectedLanguage,
+    string Summary,
+    MenuSectionDto[] Sections,
+    MenuItemDto[] Items,
+    MenuRecommendationDto[] RecommendedItems,
+    string[] Warnings,
+    string[] QuestionsToAskStaff,
+    string Status = "completed",
+    string? CurrentStep = null,
+    string? ErrorCode = null,
+    string? ErrorMessage = null,
+    DateTimeOffset? CreatedAt = null,
+    DateTimeOffset? CompletedAt = null,
+    int ImageCount = 0,
+    string? RestaurantPlaceId = null);
+public sealed record MenuScanJob(Guid MenuScanId, Guid UserId);
+
+/// <summary>Everything the menu interpreter needs to read a menu and rank it for one specific diner.</summary>
+public sealed record MenuInterpretationRequest(
+    string? Text,
+    IReadOnlyList<string> ImageDataUrls,
+    string Language,
+    string? RawText,
+    string[] SelectedCues,
+    Dictionary<string, object> Context,
+    TasteProfileDto? TasteProfile,
+    DiningProfileDto? DiningProfile,
+    string? RestaurantMetadataJson);
+
+/// <summary>
+/// The interpreter transcribes and structures in one pass, so the transcript comes back alongside the
+/// interpretation and can be reused later without paying for image reading again.
+/// <paramref name="Readable"/> is false when the images are not a legible menu.
+/// </summary>
+public sealed record MenuInterpretationResult(string OcrText, MenuInterpretation Interpretation, bool Readable);
 public sealed record MenuSectionDto(string Name, string[] ItemNames);
 public sealed record MenuItemDto(string Name, string Description, string Category, string? PriceText, string[] PossibleAllergens, bool IsKidFriendly, bool IsVegetarian, bool IsSpicy);
 public sealed record MenuRecommendationDto(string ItemName, string Reason, double SuitabilityScore, string[] Warnings);
@@ -122,7 +181,11 @@ public sealed record InteractionEventRequest(string EventType, string? EntityTyp
 
 public sealed record GoogleUserInfo(string ProviderUserId, string Email, string? DisplayName, string? AvatarUrl);
 public sealed record PlaceCandidate(string Provider, string ProviderPlaceId, string Name, string Address, double Latitude, double Longitude, decimal? Rating, int? RatingCount, int? PriceLevel, string RawPayloadJson);
-public sealed record ResolvedLocation(string Mode, string? Text, double Latitude, double Longitude, string? PlaceId, Dictionary<string, object> Assumptions);
+/// <summary>
+/// A location after resolution. Latitude/Longitude are nullable on purpose: when free text cannot be
+/// geocoded we must not substitute placeholder coordinates, because that silently searches the wrong city.
+/// </summary>
+public sealed record ResolvedLocation(string Mode, string? Text, double? Latitude, double? Longitude, string? PlaceId, Dictionary<string, object> Assumptions);
 public sealed record WeatherContext(string Summary, int TemperatureC, string DiningImpact);
 public sealed record ParsedIntent(Dictionary<string, object> NormalizedContext, Dictionary<string, object> Assumptions);
 public sealed record RankedPlace(PlaceCandidate Candidate, int Rank, string Headline, string Summary, string Vibe, string Why, string[] WhatToOrder, string GoodToKnow, string[] Cautions, double Confidence);
@@ -210,13 +273,46 @@ public interface IPlacesProvider
     Task<PlaceCandidate?> GetByPlaceIdAsync(string placeId, CancellationToken cancellationToken);
 }
 public interface ILocationResolver { Task<ResolvedLocation> ResolveAsync(LocationInput? input, CancellationToken cancellationToken); }
-public interface IWeatherProvider { Task<WeatherContext> GetCurrentAsync(double latitude, double longitude, CancellationToken cancellationToken); }
-public interface IRouteProvider { Task<string> CreateRouteUrlAsync(double fromLat, double fromLng, double toLat, double toLng, CancellationToken cancellationToken); }
-public interface IMenuOcrProvider { Task<string> ExtractTextAsync(string? imageUrl, string? imageBase64, CancellationToken cancellationToken); }
+public interface IWeatherProvider { Task<WeatherContext> GetCurrentAsync(double? latitude, double? longitude, CancellationToken cancellationToken); }
+public interface IRouteProvider
+{
+    Task<string> CreateRouteUrlAsync(double fromLat, double fromLng, double toLat, double toLng, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Directions link when we do not know where the diner is starting from. Google fills in the origin,
+    /// so text and map-pin requests still get a usable route action instead of nothing.
+    /// </summary>
+    Task<string> CreateDestinationUrlAsync(string destinationName, string? destinationPlaceId, double toLat, double toLng, CancellationToken cancellationToken);
+}
+/// <summary>
+/// Blob storage for user-uploaded images. The bucket stays private: images are served back through the API
+/// after an ownership check, so no signed URLs or extra credentials are needed.
+/// </summary>
+public interface IObjectStorage
+{
+    Task PutAsync(string objectName, Stream content, string contentType, CancellationToken cancellationToken);
+
+    /// <summary>Returns null when the object does not exist.</summary>
+    Task<Stream?> OpenReadAsync(string objectName, CancellationToken cancellationToken);
+    Task DeleteAsync(string objectName, CancellationToken cancellationToken);
+}
 public interface IAiIntentParser { Task<ParsedIntent> ParseAsync(string rawText, string[] cues, Dictionary<string, object>? context, CancellationToken cancellationToken); }
 public interface IAiPlaceRanker { Task<IReadOnlyList<RankedPlace>> RankAsync(ParsedIntent intent, IReadOnlyList<PlaceCandidate> candidates, WeatherContext weather, CancellationToken cancellationToken); }
-public interface IAiRestaurantFitAnalyzer { Task<RestaurantFitCheckResponse> AnalyzeAsync(PlaceCandidate restaurant, RestaurantFitCheckRequest request, ReservationDto reservation, CancellationToken cancellationToken); }
-public interface IAiMenuInterpreter { Task<MenuInterpretation> InterpretAsync(string text, string language, Dictionary<string, object>? diningContext, CancellationToken cancellationToken); }
+/// <summary>
+/// Everything the fit analyzer weighs: what the provider reports about the place, the diner's durable
+/// profile, and the moment they are asking about. <paramref name="VisitAt"/> comes from context["visitAt"]
+/// and is what makes opening hours a usable signal rather than trivia.
+/// </summary>
+public sealed record RestaurantFitContext(
+    PlaceCandidate Restaurant,
+    RestaurantFitCheckRequest Request,
+    ReservationDto Reservation,
+    TasteProfileDto? TasteProfile,
+    DiningProfileDto? DiningProfile,
+    DateTimeOffset? VisitAt);
+
+public interface IAiRestaurantFitAnalyzer { Task<RestaurantFitCheckResponse> AnalyzeAsync(RestaurantFitContext context, CancellationToken cancellationToken); }
+public interface IAiMenuInterpreter { Task<MenuInterpretationResult> InterpretAsync(MenuInterpretationRequest request, CancellationToken cancellationToken); }
 public interface IQuotaService
 {
     Task<QuotaStateResponse> GetAsync(Guid userId, CancellationToken cancellationToken);
@@ -290,9 +386,23 @@ public interface IRestaurantService
 
 public interface IMenuScanService
 {
-    Task<MenuScanResponse> CreateAsync(Guid userId, MenuScanRequest request, CancellationToken cancellationToken);
+    Task<MenuScanAcceptedResponse> CreateAsync(Guid userId, MenuScanRequest request, CancellationToken cancellationToken);
     Task<MenuScanResponse> GetAsync(Guid userId, Guid id, CancellationToken cancellationToken);
+
+    /// <summary>Re-ranks an existing scan against the diner's current profile. Costs no credits: no image is read again.</summary>
     Task<MenuScanResponse> RecommendAsync(Guid userId, Guid id, CancellationToken cancellationToken);
+
+    /// <summary>Stores one uploaded image and returns its object name for a later scan. Costs no credits.</summary>
+    Task<MenuImageUploadResponse> UploadImageAsync(Guid userId, Stream content, string? declaredContentType, string? fileName, CancellationToken cancellationToken);
+
+    /// <summary>Streams a scan image back to its owner. Returns null when the scan or index does not exist.</summary>
+    Task<(Stream Content, string ContentType)?> OpenImageAsync(Guid userId, Guid menuScanId, int index, CancellationToken cancellationToken);
+}
+
+public interface IMenuScanJobQueue
+{
+    ValueTask EnqueueAsync(MenuScanJob job, CancellationToken cancellationToken);
+    ValueTask<MenuScanJob> DequeueAsync(CancellationToken cancellationToken);
 }
 
 public interface IInteractionEventService { Task TrackAsync(Guid userId, InteractionEventRequest request, CancellationToken cancellationToken); }

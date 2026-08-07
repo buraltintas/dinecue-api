@@ -3,6 +3,7 @@ using DineCue.Application;
 using DineCue.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -61,6 +62,10 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("events", context => RateLimitPartition.GetFixedWindowLimiter(
         PartitionKey(context, "events"),
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 120, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
+    // Uploads are cheap for us but bandwidth-heavy, and one menu scan legitimately needs a few of them.
+    options.AddPolicy("uploads", context => RateLimitPartition.GetFixedWindowLimiter(
+        PartitionKey(context, "uploads"),
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 20, Window = TimeSpan.FromMinutes(5), QueueLimit = 0 }));
 });
 builder.Services.AddDineCueInfrastructure(builder.Configuration, builder.Environment);
 
@@ -74,15 +79,37 @@ app.Use(async (context, next) =>
     if (context.User.Identity?.IsAuthenticated == true)
     {
         var userId = context.User.GetUserId();
-        var db = context.RequestServices.GetRequiredService<DineCueDbContext>();
-        var active = await db.Users.AnyAsync(x => x.Id == userId && x.DeletedAt == null, context.RequestAborted);
-        if (!active)
+        var cache = context.RequestServices.GetRequiredService<IMemoryCache>();
+        // Cached briefly so this guard costs one query per user per window instead of one per request.
+        // The window is short enough that a deletion still takes effect almost immediately.
+        var active = await cache.GetOrCreateAsync($"account-active:{userId:N}", async entry =>
+        {
+            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(30);
+            var db = context.RequestServices.GetRequiredService<DineCueDbContext>();
+            return await db.Users.AnyAsync(x => x.Id == userId && x.DeletedAt == null, context.RequestAborted);
+        });
+        if (active != true)
             throw new ApiException("account_deleted", "This account is no longer active.", StatusCodes.Status401Unauthorized);
     }
     await next();
 });
 app.UseAuthorization();
 app.MapControllers();
+
+// Liveness/readiness probe for Cloud Run. Anonymous and deliberately free of build or dependency details.
+app.MapGet("/health", async (DineCueDbContext db, CancellationToken cancellationToken) =>
+{
+    try
+    {
+        await db.Database.ExecuteSqlRawAsync("SELECT 1", cancellationToken);
+        return Results.Ok(new { status = "ok" });
+    }
+    catch (Exception) when (!cancellationToken.IsCancellationRequested)
+    {
+        return Results.Json(new { status = "degraded" }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+}).AllowAnonymous();
+
 app.Run();
 
 static string PartitionKey(HttpContext context, string policy)

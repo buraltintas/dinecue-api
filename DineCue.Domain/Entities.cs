@@ -290,8 +290,35 @@ public sealed class MenuScan : Entity
     public string Status { get; set; } = "completed";
     public string RawAiResponseJson { get; set; } = "{}";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public string? CurrentStep { get; set; }
+    public string? ErrorCode { get; set; }
+    public string? ErrorMessage { get; set; }
+    public DateTimeOffset? StartedAt { get; set; }
+    public DateTimeOffset? CompletedAt { get; set; }
+    public DateTimeOffset? FailedAt { get; set; }
+
+    /// <summary>What the diner typed for this scan, if anything. The moment-specific layer over their profile.</summary>
+    public string? RawTextInput { get; set; }
+    public string SelectedCuesJson { get; set; } = "[]";
     public List<MenuScanItem> Items { get; set; } = [];
     public List<MenuScanRecommendation> Recommendations { get; set; } = [];
+    public List<MenuScanImage> Images { get; set; } = [];
+}
+
+/// <summary>
+/// An uploaded menu photo in private object storage. Created unattached by the upload endpoint and linked to a
+/// scan when one is created, so a diner can upload, change their mind, and retry without burning a credit.
+/// Rows that stay unattached are swept by the scan worker.
+/// </summary>
+public sealed class MenuScanImage : Entity
+{
+    public Guid UserId { get; set; }
+    public Guid? MenuScanId { get; set; }
+    public string ObjectName { get; set; } = "";
+    public string ContentType { get; set; } = "";
+    public long SizeBytes { get; set; }
+    public int Position { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
 public sealed class MenuScanItem : Entity
