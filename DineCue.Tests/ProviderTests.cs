@@ -93,6 +93,41 @@ public sealed class ProviderTests
         Assert.Equal(20000, GooglePlacesApi.ResolveRadiusMeters(DiningProfile(999999), config));
     }
 
+    [Fact]
+    public void ReadString_NeverThrowsOnAMalformedModelField()
+    {
+        // A single wrongly-typed field used to surface as an unhandled exception and a generic failure,
+        // instead of a clean recoverable one, because JsonNode.GetValue<string>() throws on non-strings.
+        var json = JsonNode.Parse("""{"a":"text","b":42,"c":true,"d":null,"e":{"x":1},"f":[1,2]}""")!;
+
+        Assert.Equal("text", GooglePlacesApi.ReadString(json["a"]));
+        Assert.Equal("42", GooglePlacesApi.ReadString(json["b"]));
+        Assert.Equal("true", GooglePlacesApi.ReadString(json["c"]));
+        Assert.Equal("", GooglePlacesApi.ReadString(json["d"]));
+        Assert.Equal("", GooglePlacesApi.ReadString(json["e"]));
+        Assert.Equal("", GooglePlacesApi.ReadString(json["f"]));
+        Assert.Equal("", GooglePlacesApi.ReadString(json["missing"]));
+        Assert.Equal("", GooglePlacesApi.ReadString(null));
+    }
+
+    [Fact]
+    public async Task MenuInterpreter_TreatsAnUnexpectedShapeAsUnreadableRatherThanCrashing()
+    {
+        // Every field is the wrong type. This must degrade to "not readable" so the diner gets actionable
+        // guidance and their credit back, not an opaque failure.
+        var handler = new TestHost.StubHttpHandler(TestHost.StubHttpHandler.OpenAi("""
+        {"readable":"yes","detectedLanguage":7,"ocrText":123,"summary":{"a":1},"sections":"none","items":42,"recommendedItems":null,"warnings":1,"questionsToAskStaff":{}}
+        """));
+        var interpreter = new OpenAiMenuInterpreter(TestHost.CreateOpenAiClient(handler), NullLogger<OpenAiMenuInterpreter>.Instance);
+
+        var result = await interpreter.InterpretAsync(
+            new MenuInterpretationRequest(null, ["data:image/jpeg;base64,AAAA"], "tr", null, [], new Dictionary<string, object>(), null, null, null),
+            CancellationToken.None);
+
+        Assert.False(result.Readable);
+        Assert.Empty(result.Interpretation.Items);
+    }
+
     // --- Location resolution --------------------------------------------------------------------------
 
     [Fact]

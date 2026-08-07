@@ -451,6 +451,17 @@ internal static class SupportedLanguages
         return NormalizeRequired(language);
     }
 
+    /// <summary>
+    /// Normalizes a language that came from a model response rather than from a caller. Never throws: an
+    /// unsupported value falls back instead of failing the whole job, because the model reporting a bad
+    /// language code is not a reason to lose the diner's work (or their monthly credit).
+    /// </summary>
+    public static string NormalizeOrFallback(string? language, string fallback)
+    {
+        var normalized = language?.Trim().ToLowerInvariant();
+        return normalized != null && Values.Contains(normalized) ? normalized : fallback;
+    }
+
     public static string NormalizeRequired(string? language)
     {
         var normalized = language?.Trim().ToLowerInvariant();
@@ -2158,6 +2169,21 @@ internal static class GooglePlacesApi
         return flags.Count == 0 ? null : flags;
     }
 
+    /// <summary>
+    /// Reads a string without throwing. <c>JsonNode.GetValue&lt;string&gt;()</c> throws when the node holds a
+    /// number, bool, object, or array, which turns one malformed model field into an unhandled exception and
+    /// a generic failure instead of a clean, recoverable one.
+    /// </summary>
+    public static string ReadString(JsonNode? node)
+    {
+        if (node is not JsonValue value) return "";
+        if (value.TryGetValue<string>(out var text)) return text ?? "";
+        // Numbers and booleans are still meaningful as display text; anything else is not.
+        if (value.TryGetValue<double>(out var number)) return number.ToString(CultureInfo.InvariantCulture);
+        if (value.TryGetValue<bool>(out var flag)) return flag ? "true" : "false";
+        return "";
+    }
+
     public static bool? ReadBool(JsonNode? node) =>
         node is JsonValue value && value.TryGetValue<bool>(out var parsed) ? parsed : null;
 
@@ -2733,8 +2759,8 @@ internal sealed class OpenAiJsonClient(
 
             await using var stream = await response.Content.ReadAsStreamAsync(requestCt);
             var json = await JsonNode.ParseAsync(stream, cancellationToken: requestCt);
-            var finishReason = json?["choices"]?[0]?["finish_reason"]?.GetValue<string>();
-            var content = json?["choices"]?[0]?["message"]?["content"]?.GetValue<string>();
+            var finishReason = GooglePlacesApi.ReadString(json?["choices"]?[0]?["finish_reason"]);
+            var content = GooglePlacesApi.ReadString(json?["choices"]?[0]?["message"]?["content"]);
             if (string.IsNullOrWhiteSpace(content))
             {
                 // A length cutoff is worth retrying; an empty body for any other reason is not.
@@ -2961,17 +2987,17 @@ internal sealed class OpenAIRecommendationReasoner(
     private static RecommendationReasoningResult ParseReasoning(JsonNode json)
     {
         var recommendations = json["recommendations"]?.AsArray().Select(x => new ReasonedRecommendation(
-            DisplayText.CleanInline(x?["placeId"]?.GetValue<string>() ?? "", false),
+            DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["placeId"]), false),
             ReadInt(x?["rank"], 0),
-            DisplayText.CleanInline(x?["label"]?.GetValue<string>() ?? "", false),
+            DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["label"]), false),
             ReadInt(x?["matchScore"], -1),
-            DisplayText.CleanInline(x?["reason"]?.GetValue<string>() ?? "", true),
+            DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["reason"]), true),
             ReadDisplayArray(x?["whyItFits"], true),
             ReadDisplayArray(x?["watchOut"], true),
             ReadDisplayArray(x?["bestFor"], false),
-            DisplayText.CleanInline(x?["confidence"]?.GetValue<string>() ?? "", false))).ToList() ?? [];
+            DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["confidence"]), false))).ToList() ?? [];
         return new RecommendationReasoningResult(
-            DisplayText.CleanInline(json["summary"]?.GetValue<string>() ?? "", true),
+            DisplayText.CleanInline(GooglePlacesApi.ReadString(json["summary"]), true),
             JsonText.Deserialize(json["interpretedIntent"]?.ToJsonString(), new Dictionary<string, object>()),
             recommendations);
     }
@@ -3051,7 +3077,7 @@ internal sealed class OpenAIRecommendationReasoner(
 
     private static string[] ReadDisplayArray(JsonNode? node, bool ensurePunctuation) =>
         node?.AsArray()
-            .Select(x => DisplayText.CleanInline(x?.GetValue<string>() ?? "", ensurePunctuation))
+            .Select(x => DisplayText.CleanInline(GooglePlacesApi.ReadString(x), ensurePunctuation))
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .ToArray() ?? [];
 }
@@ -3726,7 +3752,8 @@ internal sealed class MenuScanProcessor(
     internal void PersistInterpretation(MenuScan scan, MenuInterpretation interpretation, string ocrText)
     {
         scan.OcrText = string.IsNullOrWhiteSpace(ocrText) ? scan.OcrText : ocrText;
-        scan.Language = SupportedLanguages.NormalizeOrDefault(interpretation.DetectedLanguage);
+        // Keeps the scan's own language when the model reports something unusable, rather than throwing here.
+        scan.Language = SupportedLanguages.NormalizeOrFallback(interpretation.DetectedLanguage, scan.Language);
         scan.RawAiResponseJson = JsonText.Serialize(interpretation);
         foreach (var item in interpretation.Items)
         {
@@ -4687,18 +4714,26 @@ internal sealed class OpenAiMenuInterpreter(
         var readable = GooglePlacesApi.ReadBool(json["readable"]) ?? true;
         var items = ReadItems(json["items"]);
         var interpretation = new MenuInterpretation(
-            SupportedLanguages.NormalizeOrDefault(json["detectedLanguage"]?.GetValue<string>()),
-            DisplayText.CleanInline(json["summary"]?.GetValue<string>() ?? "", true),
+            // The model's own report, so an odd value falls back to what the diner asked for.
+            SupportedLanguages.NormalizeOrFallback(GooglePlacesApi.ReadString(json["detectedLanguage"]), request.Language),
+            DisplayText.CleanInline(GooglePlacesApi.ReadString(json["summary"]), true),
             ReadSections(json["sections"]),
             items,
             ReadRecommendations(json["recommendedItems"], items),
             ReadTextList(json["warnings"]),
             ReadTextList(json["questionsToAskStaff"]));
-        var ocrText = json["ocrText"]?.GetValue<string>() ?? "";
+        var ocrText = GooglePlacesApi.ReadString(json["ocrText"]);
 
-        if (!readable || (items.Length == 0 && string.IsNullOrWhiteSpace(ocrText)))
+        // No real menu transcribes to a handful of characters, so a token amount of text counts as nothing.
+        // Without this floor a garbage response passes as a successful scan and the diner loses a credit
+        // for an empty result.
+        const int minimumTranscriptLength = 40;
+        var hasContent = items.Length > 0 || ocrText.Trim().Length >= minimumTranscriptLength;
+        if (!readable || !hasContent)
         {
-            logger.LogInformation("Menu scan images were not readable as a menu.");
+            logger.LogInformation(
+                "Menu scan images were not readable as a menu. Readable={Readable}, ItemCount={ItemCount}, TranscriptLength={TranscriptLength}",
+                readable, items.Length, ocrText.Trim().Length);
             return new MenuInterpretationResult(ocrText, interpretation, Readable: false);
         }
         return new MenuInterpretationResult(ocrText, interpretation, Readable: true);
@@ -4790,7 +4825,7 @@ internal sealed class OpenAiMenuInterpreter(
             ? []
             : array
                 .Select(x => new MenuSectionDto(
-                    DisplayText.CleanInline(x?["name"]?.GetValue<string>() ?? "", false),
+                    DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["name"]), false),
                     GooglePlacesApi.ReadStringArray(x?["itemNames"])))
                 .Where(x => !string.IsNullOrWhiteSpace(x.Name))
                 .ToArray();
@@ -4800,9 +4835,9 @@ internal sealed class OpenAiMenuInterpreter(
             ? []
             : array
                 .Select(x => new MenuItemDto(
-                    DisplayText.CleanInline(x?["name"]?.GetValue<string>() ?? "", false),
-                    DisplayText.CleanInline(x?["description"]?.GetValue<string>() ?? "", true),
-                    DisplayText.CleanInline(x?["category"]?.GetValue<string>() ?? "", false),
+                    DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["name"]), false),
+                    DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["description"]), true),
+                    DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["category"]), false),
                     NullableText(x?["priceText"]),
                     GooglePlacesApi.ReadStringArray(x?["possibleAllergens"]),
                     GooglePlacesApi.ReadBool(x?["isKidFriendly"]) ?? false,
@@ -4817,8 +4852,8 @@ internal sealed class OpenAiMenuInterpreter(
         var itemNames = items.Select(x => x.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
         return array
             .Select(x => new MenuRecommendationDto(
-                DisplayText.CleanInline(x?["itemName"]?.GetValue<string>() ?? "", false),
-                DisplayText.CleanInline(x?["reason"]?.GetValue<string>() ?? "", true),
+                DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["itemName"]), false),
+                DisplayText.CleanInline(GooglePlacesApi.ReadString(x?["reason"]), true),
                 Math.Clamp(GooglePlacesApi.ReadDouble(x?["suitabilityScore"]) ?? 0.5, 0, 1),
                 ReadTextList(x?["warnings"])))
             // A recommended dish that is not on the menu we just read would be a hallucination.
@@ -5094,20 +5129,20 @@ internal sealed class OpenAiRestaurantFitAnalyzer(
         var confidence = GooglePlacesApi.ReadDouble(json["confidence"]);
         if (confidence is null or < 0 or > 1)
             throw RepairNeeded($"confidence was '{json["confidence"]}' but must be a number between 0 and 1.");
-        var verdict = DisplayText.CleanInline(json["verdict"]?.GetValue<string>() ?? "", false);
+        var verdict = DisplayText.CleanInline(GooglePlacesApi.ReadString(json["verdict"]), false);
         if (string.IsNullOrWhiteSpace(verdict))
             throw RepairNeeded("verdict was empty. Return a short natural label in the requested language.");
 
         return new RestaurantFitCheckResponse(
             fitScore.Value,
             verdict,
-            DisplayText.CleanInline(json["summary"]?.GetValue<string>() ?? "", true),
+            DisplayText.CleanInline(GooglePlacesApi.ReadString(json["summary"]), true),
             ReadTextList(json["pros"]),
             ReadTextList(json["cons"]),
             ReadTextList(json["questionsToAsk"]),
             confidence.Value,
             ReadSignals(json["relevantSignals"]),
-            DisplayText.CleanInline(json["reservationAdvice"]?.GetValue<string>() ?? "", true),
+            DisplayText.CleanInline(GooglePlacesApi.ReadString(json["reservationAdvice"]), true),
             reservation);
     }
 
@@ -5118,12 +5153,12 @@ internal sealed class OpenAiRestaurantFitAnalyzer(
         if (node is not JsonArray array) return signals;
         foreach (var entry in array)
         {
-            var name = entry?["signal"]?.GetValue<string>();
+            var name = GooglePlacesApi.ReadString(entry?["signal"]);
             if (string.IsNullOrWhiteSpace(name)) continue;
             signals[name!] = new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["value"] = entry?["value"]?.GetValue<string>() ?? "",
-                ["impact"] = entry?["impact"]?.GetValue<string>() ?? "neutral"
+                ["value"] = GooglePlacesApi.ReadString(entry?["value"]),
+                ["impact"] = GooglePlacesApi.ReadString(entry?["impact"]) is { Length: > 0 } impact ? impact : "neutral"
             };
         }
         return signals;
