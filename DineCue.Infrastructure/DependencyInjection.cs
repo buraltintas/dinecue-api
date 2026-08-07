@@ -4750,6 +4750,33 @@ internal sealed class OpenAiMenuInterpreter(
                 "Flag every recommended dish that may contain a listed allergen, even if you still recommend it.",
                 "Do not invent dishes, prices, or ingredients."
             },
+            // Also described in prose because OpenAI:UseStructuredOutputs can be switched off, and in plain
+            // json_object mode the prompt is the only place the model learns the field names.
+            schema = new
+            {
+                readable = "true unless the images are not a legible menu",
+                detectedLanguage = "en|de|tr",
+                ocrText = "string, the menu text exactly as printed",
+                summary = "string",
+                sections = new[] { new { name = "string", itemNames = new[] { "string" } } },
+                items = new[]
+                {
+                    new
+                    {
+                        name = "string",
+                        description = "string",
+                        category = "string",
+                        priceText = "string or null when unreadable",
+                        possibleAllergens = new[] { "string" },
+                        isKidFriendly = false,
+                        isVegetarian = false,
+                        isSpicy = false
+                    }
+                },
+                recommendedItems = new[] { new { itemName = "string, must match an items[].name", reason = "string", suitabilityScore = 0.0, warnings = new[] { "string" } } },
+                warnings = new[] { "string" },
+                questionsToAskStaff = new[] { "string" }
+            },
             restaurantMetadata = string.IsNullOrWhiteSpace(request.RestaurantMetadataJson)
                 ? null
                 : JsonText.Deserialize(request.RestaurantMetadataJson, new Dictionary<string, object>()),
@@ -5040,6 +5067,20 @@ internal sealed class OpenAiRestaurantFitAnalyzer(
                 "If openingPeriods or openingHours do not cover the intended visit time, say so in cons.",
                 "Do not claim the place is quiet, family-friendly, reservable, or accessible unless metadata says so.",
                 "Do not describe menu items; you have not seen the menu."
+            },
+            // Also described in prose because OpenAI:UseStructuredOutputs can be switched off, and in plain
+            // json_object mode the prompt is the only place the model learns the field names.
+            schema = new
+            {
+                fitScore = "integer 0-100",
+                verdict = "short localized label",
+                summary = "string",
+                pros = new[] { "string" },
+                cons = new[] { "string" },
+                questionsToAsk = new[] { "string" },
+                confidence = "number between 0 and 1",
+                reservationAdvice = "string",
+                relevantSignals = new[] { new { signal = "string", value = "string", impact = "positive|negative|neutral" } }
             }
         };
         return JsonText.Serialize(prompt);

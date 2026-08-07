@@ -201,6 +201,66 @@ public sealed class BffPayloadCompatibilityTests
         Assert.Contains("\"sizeBytes\"", json);
     }
 
+    /// <summary>
+    /// Every prompt must describe its own response shape in prose, not only through the strict json_schema
+    /// response format. OpenAI:UseStructuredOutputs is a runtime kill switch, and with it off the prompt is
+    /// the only place the model learns the field names.
+    /// </summary>
+    [Fact]
+    public void MenuScanPrompt_DescribesItsResponseShapeInProse()
+    {
+        var prompt = OpenAiMenuInterpreter.BuildPrompt(new MenuInterpretationRequest(
+            "Mercimek çorbası 120 TL", [], "tr", null, [], new Dictionary<string, object>(), null, null, null));
+
+        foreach (var field in new[]
+                 {
+                     "readable", "detectedLanguage", "ocrText", "summary", "sections", "itemNames",
+                     "items", "priceText", "possibleAllergens", "isKidFriendly", "isVegetarian", "isSpicy",
+                     "recommendedItems", "itemName", "suitabilityScore", "warnings", "questionsToAskStaff"
+                 })
+        {
+            Assert.Contains(field, prompt, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void FitCheckPrompt_DescribesItsResponseShapeInProse()
+    {
+        var prompt = OpenAiRestaurantFitAnalyzer.BuildPrompt(
+            new RestaurantFitContext(
+                new PlaceCandidate("google_places", "place-1", "A", "Addr", 1, 2, 4.4m, 10, 2, "{}"),
+                new RestaurantFitCheckRequest(null, "en", null),
+                new ReservationDto("google_maps_only", "google_maps", null, null, 0.5),
+                null,
+                null,
+                null),
+            repairFeedback: null);
+
+        foreach (var field in new[]
+                 {
+                     "fitScore", "verdict", "summary", "pros", "cons", "questionsToAsk",
+                     "confidence", "reservationAdvice", "relevantSignals", "impact"
+                 })
+        {
+            Assert.Contains(field, prompt, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void RecommendationPrompt_DescribesItsResponseShapeInProse()
+    {
+        var prompt = OpenAIRecommendationReasoner.BuildPrompt(
+            TestHost.Intent(),
+            [TestHost.Candidate()],
+            repair: false,
+            repairFeedback: null);
+
+        foreach (var field in new[] { "summary", "interpretedIntent", "recommendations", "placeId", "matchScore", "whyItFits", "watchOut", "bestFor", "confidence" })
+        {
+            Assert.Contains(field, prompt, StringComparison.Ordinal);
+        }
+    }
+
     [Fact]
     public void MenuScanAcceptedResponse_SerializesTheIdTheUiNavigatesTo()
     {
