@@ -206,6 +206,139 @@ public sealed class BffPayloadCompatibilityTests
     /// response format. OpenAI:UseStructuredOutputs is a runtime kill switch, and with it off the prompt is
     /// the only place the model learns the field names.
     /// </summary>
+    /// <summary>
+    /// Every stored preference has to reach the flow that can act on it. The recommendation prompt used to
+    /// dump the profile as a raw DTO with no instruction attached, so the model saw a diner's allergies but
+    /// was never told to honour them.
+    /// </summary>
+    [Fact]
+    public void RecommendationPrompt_CarriesTheStoredProfileAndTellsTheModelToHonourIt()
+    {
+        var prompt = OpenAIRecommendationReasoner.BuildPrompt(
+            RichIntent(),
+            [TestHost.Candidate()],
+            repair: false,
+            repairFeedback: null);
+
+        // Every taste and dining field the diner can set must be present.
+        foreach (var field in new[]
+                 {
+                     "allergies", "dietaryRestrictions", "dislikedIngredients", "dislikedCuisines",
+                     "favoriteCuisines", "favoriteDishes", "drinkPreferences", "spiceTolerance",
+                     "sweetSaltyPreference", "usuallyWithKids", "prefersQuietPlaces", "prefersOutdoor",
+                     "budgetSensitivity", "likesLocalExperiences", "likesPremiumPlaces", "needsParking",
+                     "needsAccessibility"
+                 })
+        {
+            Assert.Contains($"\"{field}\"", prompt, StringComparison.Ordinal);
+        }
+
+        // Values, not just field names.
+        Assert.Contains("peanut", prompt, StringComparison.Ordinal);
+        Assert.Contains("vegetarian", prompt, StringComparison.Ordinal);
+        // And the rules that make them binding rather than decorative.
+        Assert.Contains("hardRules", prompt, StringComparison.Ordinal);
+        Assert.Contains("contradicts a dietary restriction or allergy", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void FitCheckPrompt_CarriesEveryVenueRelevantPreference()
+    {
+        var prompt = OpenAiRestaurantFitAnalyzer.BuildPrompt(
+            new RestaurantFitContext(
+                TestHost.Candidate(),
+                new RestaurantFitCheckRequest(null, "en", null),
+                new ReservationDto("google_maps_only", "google_maps", null, null, 0.5),
+                TestHost.Taste(allergies: ["peanut"], dietaryRestrictions: ["vegetarian"]),
+                new DiningProfileDto(true, true, true, 4, true, false, true, true, 1800),
+                null),
+            repairFeedback: null);
+
+        foreach (var field in new[]
+                 {
+                     "allergies", "dietaryRestrictions", "dislikedCuisines", "favoriteCuisines",
+                     "spiceTolerance", "drinkPreferences", "usuallyWithKids", "prefersQuietPlaces",
+                     "prefersOutdoor", "budgetSensitivity", "likesLocalExperiences", "likesPremiumPlaces",
+                     "needsParking", "needsAccessibility"
+                 })
+        {
+            Assert.Contains($"\"{field}\"", prompt, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void MenuScanPrompt_CarriesEveryDishRelevantPreference()
+    {
+        var prompt = OpenAiMenuInterpreter.BuildPrompt(new MenuInterpretationRequest(
+            "Mercimek çorbası", [], "tr", null, [],
+            new Dictionary<string, object>(),
+            TestHost.Taste(allergies: ["peanut"], dietaryRestrictions: ["vegetarian"], dislikedIngredients: ["coriander"]),
+            new DiningProfileDto(true, false, false, 3, true, false, false, false, 1800),
+            null));
+
+        foreach (var field in new[]
+                 {
+                     "allergies", "dietaryRestrictions", "dislikedIngredients", "dislikedCuisines",
+                     "favoriteCuisines", "favoriteDishes", "spiceTolerance", "sweetSaltyPreference",
+                     "drinkPreferences", "usuallyWithKids", "budgetSensitivity"
+                 })
+        {
+            Assert.Contains($"\"{field}\"", prompt, StringComparison.Ordinal);
+        }
+        Assert.Contains("coriander", prompt, StringComparison.Ordinal);
+        Assert.Contains("Never recommend a dish that conflicts", prompt, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A stored dietary restriction has to shape the candidate pool, not only the ranking: a vegetarian
+    /// searching the same pool as everyone else can only be served by whatever generic queries return.
+    /// </summary>
+    [Fact]
+    public void CandidateSearch_UsesStoredDietaryAndCuisinePreferences()
+    {
+        var vegetarian = RecommendationCandidateSearchPlanner.BuildQueries(
+            TestHost.Intent(rawText: "Somewhere for dinner", location: new LocationInput("text", "Antalya", null, null, null)) with
+            {
+                TasteProfile = TestHost.Taste(dietaryRestrictions: ["vegetarian"])
+            });
+
+        Assert.Contains(vegetarian, x => x.Contains("vegetarian", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("vegan", "vegan")]
+    [InlineData("vejetaryen", "vegetarian")]
+    [InlineData("gluten free", "gluten free")]
+    [InlineData("halal", "halal")]
+    [InlineData("no pork", "")]
+    public void DietaryTerm_MapsOnlyRestrictionsThatChangeWhichVenuesQualify(string restriction, string expected)
+    {
+        var term = RecommendationCandidateSearchPlanner.DietaryTerm(TestHost.Taste(dietaryRestrictions: [restriction]));
+
+        if (expected.Length == 0) Assert.Equal("", term);
+        else Assert.Contains(expected, term, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void FavoriteCuisineTerm_YieldsToWhatTheDinerAskedForTonight()
+    {
+        var taste = TestHost.Taste();
+        var withFavorite = taste with { FavoriteCuisines = ["Japanese"] };
+
+        Assert.Contains("Japanese", RecommendationCandidateSearchPlanner.FavoriteCuisineTerm(withFavorite, "somewhere for dinner"));
+        // A standing preference must not override tonight's explicit request.
+        Assert.Equal("", RecommendationCandidateSearchPlanner.FavoriteCuisineTerm(withFavorite, "japanese ramen tonight"));
+        Assert.Equal("", RecommendationCandidateSearchPlanner.FavoriteCuisineTerm(taste, "somewhere for dinner"));
+    }
+
+    private static DiningIntent RichIntent() =>
+        TestHost.Intent() with
+        {
+            TasteProfile = TestHost.Taste(allergies: ["peanut"], dietaryRestrictions: ["vegetarian"], dislikedIngredients: ["coriander"]),
+            DiningProfile = new DiningProfileDto(true, true, false, 4, true, false, true, false, 1800),
+            Profile = new ProfileDto("Ada", "en", "TR", "TRY", "km")
+        };
+
     [Fact]
     public void MenuScanPrompt_DescribesItsResponseShapeInProse()
     {

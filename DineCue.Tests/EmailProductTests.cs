@@ -15,6 +15,49 @@ public sealed class EmailProductTests
     private static readonly string[] Locales = ["en", "tr", "de"];
     private static readonly string[] Forbidden = ["API", "backend", "BFF", "token", "session", "provider", "OpenAI", "Google Places", "Resend"];
 
+    /// <summary>
+    /// The welcome email is the one moment we can reasonably ask a new diner to set their preferences, and
+    /// every AI flow reads them afterwards. It must explain what the product does and link to that screen.
+    /// </summary>
+    [Fact]
+    public void WelcomeEmail_ExplainsEachFlowAndAsksForPreferences()
+    {
+        var renderer = new EmailTemplateRenderer();
+
+        foreach (var locale in Locales)
+        {
+            var welcome = renderer.RenderWelcome(new EmailTemplateModel(
+                locale,
+                DisplayName: "Ada",
+                LinkUrl: "https://app.example.com/app/find",
+                PreferencesUrl: "https://app.example.com/app/profile"));
+
+            // All three capabilities described, not just named.
+            Assert.Contains("https://app.example.com/app/profile", welcome.HtmlBody);
+            Assert.Contains("https://app.example.com/app/profile", welcome.TextBody);
+            Assert.Contains("5", welcome.HtmlBody);
+
+            // The plain-text part must carry the same substance as the HTML part.
+            Assert.True(welcome.TextBody.Length > 700, $"{locale} text body is too thin: {welcome.TextBody.Length}");
+            Assert.Contains("1.", welcome.TextBody);
+            Assert.Contains("2.", welcome.TextBody);
+            Assert.Contains("3.", welcome.TextBody);
+        }
+    }
+
+    [Fact]
+    public void WelcomeEmail_StillReadsWellWithoutAConfiguredAppUrl()
+    {
+        // Email:AppBaseUrl is optional, and the guidance has to survive without a link to hang it on.
+        var welcome = new EmailTemplateRenderer().RenderWelcome(new EmailTemplateModel("tr", DisplayName: "Ada"));
+
+        Assert.DoesNotContain("<a ", welcome.HtmlBody, StringComparison.OrdinalIgnoreCase);
+        // The guidance itself is still there; only the link that would have carried it is gone.
+        Assert.Contains("Önce tercihlerini ayarla", welcome.TextBody);
+        Assert.Contains("Menü tarama", welcome.TextBody);
+        Assert.Contains("Uygunluk kontrolü", welcome.TextBody);
+    }
+
     [Fact]
     public void OtpWelcomeAndMonthlyRecapTemplates_RenderLocalizedSafeHtmlAndText()
     {

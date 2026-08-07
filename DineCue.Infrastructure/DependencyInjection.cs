@@ -71,6 +71,9 @@ public sealed class ProductEmailOptions
     public bool MonthlyRecapEnabled { get; set; }
     public bool MonthlyRecapEnabledByDefault { get; set; }
     public string HistoryUrlPath { get; set; } = "/app/history";
+
+    /// <summary>Where the welcome email points a new diner to set their taste and dining preferences.</summary>
+    public string PreferencesUrlPath { get; set; } = "/app/profile";
 }
 
 public sealed class GoogleAuthOptions
@@ -1892,13 +1895,46 @@ public static class RecommendationCandidateSearchPlanner
         Add(queries, Join(FamilyTerm(cues, contextTerms), MealMoment(intent, raw), location));
         Add(queries, Join(BudgetTerm(cues, contextTerms), "restaurant", location));
         Add(queries, Join(AtmosphereTerm(cues, contextTerms), "restaurant", location));
+        // The stored profile used to influence only the ranking prompt, so a diner with a dietary
+        // restriction searched the same pool as everyone else and could only be served by whatever the
+        // generic queries happened to return. These variants put their profile into the pool itself.
+        Add(queries, Join(DietaryTerm(intent.TasteProfile), "restaurant", location));
+        Add(queries, Join(FavoriteCuisineTerm(intent.TasteProfile, raw), "restaurant", location));
         Add(queries, Join(string.Join(" ", terms.Where(x => x.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).Take(5)), location));
 
         return queries
             .Where(x => x.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(6)
+            .Take(8)
             .ToArray();
+    }
+
+    /// <summary>
+    /// Turns a stored dietary restriction into a search term, so the candidate pool can actually contain
+    /// places that suit it. Only restrictions that meaningfully change which venues qualify are mapped.
+    /// </summary>
+    internal static string DietaryTerm(TasteProfileDto? taste)
+    {
+        var restrictions = taste?.DietaryRestrictions ?? [];
+        if (restrictions.Length == 0) return "";
+        if (restrictions.Any(x => ContainsAny(x, "vegan"))) return "vegan restaurant";
+        if (restrictions.Any(x => ContainsAny(x, "vegetarian", "vejetaryen", "vegetarisch"))) return "vegetarian restaurant";
+        if (restrictions.Any(x => ContainsAny(x, "gluten", "celiac", "çölyak", "zöliakie"))) return "gluten free restaurant";
+        if (restrictions.Any(x => ContainsAny(x, "halal", "helal"))) return "halal restaurant";
+        if (restrictions.Any(x => ContainsAny(x, "kosher", "koşer"))) return "kosher restaurant";
+        return "";
+    }
+
+    /// <summary>
+    /// Adds a favourite cuisine to the pool, but only when the diner did not already name one this time:
+    /// what they asked for tonight must outrank a standing preference.
+    /// </summary>
+    internal static string FavoriteCuisineTerm(TasteProfileDto? taste, string rawText)
+    {
+        var favorites = (taste?.FavoriteCuisines ?? []).Select(Clean).Where(x => x.Length is > 1 and <= 40).ToArray();
+        if (favorites.Length == 0) return "";
+        if (favorites.Any(x => rawText.Contains(x, StringComparison.OrdinalIgnoreCase))) return "";
+        return favorites[0] + " restaurant";
     }
 
     public static IReadOnlyList<PlaceCandidate> Deduplicate(IEnumerable<PlaceCandidate> candidates)
@@ -2975,8 +3011,43 @@ internal sealed class OpenAIRecommendationReasoner(
                 interpretedIntent = new { mealMoment = "breakfast|lunch|dinner|coffee|drinks|dessert|unknown", vibe = "string", constraints = new[] { "string" }, language = "en|de|tr" },
                 recommendations = new[] { new { placeId = "string from candidates only", rank = 1, label = "short localized headline", matchScore = 0, reason = "string", whyItFits = new[] { "string" }, watchOut = new[] { "string" }, bestFor = new[] { "string" }, confidence = "low|medium|high" } }
             },
+            // The profile was previously dumped as a raw DTO with no instruction attached, so the model saw
+            // a diner's allergies and preferences but was never told to act on them. These rules make the
+            // stored profile binding rather than decorative.
+            hardRules = new[]
+            {
+                "Never rank a place whose candidate metadata contradicts a dietary restriction or allergy the diner listed. If nothing in the pool clearly suits them, return fewer places and say why in watchOut.",
+                "When a diner lists dietary restrictions, prefer candidates whose metadata supports them (for example servesVegetarianFood) and say in watchOut when metadata cannot confirm it.",
+                "Treat dislikedCuisines and dislikedIngredients as reasons to rank a place lower, not as things to mention approvingly.",
+                "Respect budgetSensitivity against priceLevel: a price-conscious diner should not be led to the most expensive option without a reason.",
+                "Only claim a place suits kids, quiet, outdoor, parking, or accessibility needs when candidate metadata supports it.",
+                "Do not restate the diner's profile back to them; use it to choose, not to describe."
+            },
             request = new { intent.RawText, intent.Language, intent.SelectedCues, intent.Context, location = intent.Location },
-            profile = new { intent.Profile, intent.TasteProfile, intent.DiningProfile },
+            // Flattened deliberately, mirroring the menu scan and fit check prompts, so the fields the model
+            // must honour are named rather than nested inside a serialized DTO.
+            diner = new
+            {
+                allergies = intent.TasteProfile?.Allergies ?? [],
+                dietaryRestrictions = intent.TasteProfile?.DietaryRestrictions ?? [],
+                dislikedIngredients = intent.TasteProfile?.DislikedIngredients ?? [],
+                dislikedCuisines = intent.TasteProfile?.DislikedCuisines ?? [],
+                favoriteCuisines = intent.TasteProfile?.FavoriteCuisines ?? [],
+                favoriteDishes = intent.TasteProfile?.FavoriteDishes ?? [],
+                drinkPreferences = intent.TasteProfile?.DrinkPreferences ?? [],
+                spiceTolerance = intent.TasteProfile?.SpiceTolerance,
+                sweetSaltyPreference = intent.TasteProfile?.SweetSaltyPreference,
+                usuallyWithKids = intent.DiningProfile?.UsuallyWithKids,
+                prefersQuietPlaces = intent.DiningProfile?.PrefersQuietPlaces,
+                prefersOutdoor = intent.DiningProfile?.PrefersOutdoor,
+                budgetSensitivity = intent.DiningProfile?.BudgetSensitivity,
+                likesLocalExperiences = intent.DiningProfile?.LikesLocalExperiences,
+                likesPremiumPlaces = intent.DiningProfile?.LikesPremiumPlaces,
+                needsParking = intent.DiningProfile?.NeedsParking,
+                needsAccessibility = intent.DiningProfile?.NeedsAccessibility,
+                country = intent.Profile?.Country,
+                currency = intent.Profile?.Currency
+            },
             savedPlaces = intent.SavedPlaces.Select(x => new { x.ProviderPlaceId, x.Name }),
             recentHistory = intent.RecentHistory.Select(x => new { x.RawText, x.LocationText }),
             candidates = candidates.Select(x => new { placeId = x.ProviderPlaceId, x.Name, x.Address, x.Rating, x.RatingCount, x.PriceLevel, metadata = JsonText.Deserialize(x.RawPayloadJson, new Dictionary<string, object>()) })
@@ -4174,11 +4245,93 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
         var action = Action(locale, "first_decision", model.LinkUrl);
         var copy = locale switch
         {
-            "tr" => ("DineCue'ya hoş geldin", $"Merhaba {name}, DineCue yemek kararlarını ruh haline, yanında kim olduğuna, bütçene ve bulunduğun yere göre daha kolay vermene yardımcı olur.\n\nDineCue ile sana uygun mekanlar bulabilir, menüleri daha hızlı anlayabilir, bir restoranın o ana uyup uymadığını kontrol edebilir ve beğendiğin yerleri kaydedebilirsin.\n\nFree plan her ay 5 yemek kararı içerir.", "İyi kararlar küçük bir keyifle başlar."),
-            "de" => ("Willkommen bei DineCue", $"Hallo {name}, DineCue hilft dir, Essensentscheidungen nach Stimmung, Begleitung, Budget und Ort entspannter zu treffen.\n\nDu kannst passende Orte finden, Speisekarten schneller verstehen, prüfen, ob ein Restaurant gerade passt, und gute Orte für später speichern.\n\nDer Free Plan enthält jeden Monat 5 Essensentscheidungen.", "Gute Abende beginnen oft mit einer leichteren Entscheidung."),
-            _ => ("Welcome to DineCue", $"Hi {name}, DineCue helps you make dining decisions around your mood, company, budget, and location.\n\nYou can find places that fit, understand menus faster, check whether a restaurant suits the moment, and save places you like.\n\nThe Free plan includes 5 dining decisions each month.", "Good meals often start with an easier choice.")
+            "tr" => ("DineCue'ya hoş geldin", $"Merhaba {name}, DineCue yemek kararlarını ruh haline, yanında kim olduğuna, bütçene ve bulunduğun yere göre daha kolay vermene yardımcı olur.\n\nAşağıda tam olarak ne yaptığımızı ve nasıl çalıştığını anlattım.", "İyi kararlar küçük bir keyifle başlar."),
+            "de" => ("Willkommen bei DineCue", $"Hallo {name}, DineCue hilft dir, Essensentscheidungen nach Stimmung, Begleitung, Budget und Ort entspannter zu treffen.\n\nUnten steht genau, was wir tun und wie es funktioniert.", "Gute Abende beginnen oft mit einer leichteren Entscheidung."),
+            _ => ("Welcome to DineCue", $"Hi {name}, DineCue helps you make dining decisions around your mood, company, budget, and location.\n\nHere is exactly what we do and how it works.", "Good meals often start with an easier choice.")
         };
-        return Layout(locale, copy.Item1, copy.Item2, copy.Item3, action);
+        var details = WelcomeDetails(locale, model.PreferencesUrl);
+        return Layout(locale, copy.Item1, copy.Item2, copy.Item3, action, customHtml: details.Html, customText: details.Text);
+    }
+
+    /// <summary>
+    /// Explains the three flows concretely and asks the diner to set their preferences. Worth the space:
+    /// preferences are what every flow personalizes from, and a diner who never sets them silently gets
+    /// weaker results for reasons they cannot see.
+    /// </summary>
+    private static (string Html, string Text) WelcomeDetails(string locale, string? preferencesUrl)
+    {
+        var (stepsTitle, steps, prefsTitle, prefsBody, prefsCta, plan) = locale switch
+        {
+            "tr" => (
+                "Nasıl çalışır",
+                new[]
+                {
+                    ("Restoran bul", "Ne istediğini kendi cümlelerinle yaz: “çocuklarla sakin bir akşam yemeği, çok pahalı olmasın”. Konumunu, ruh halini ve tercihlerini birleştirip karar verilebilir üç seçenek çıkarırız — filtre listesi değil, gerekçeli üç öneri."),
+                    ("Menü tarama", "Restorandayken menünün fotoğrafını çek. Menüyü okuyup sana uyan yemekleri öne çıkarırız; alerjin veya diyet kısıtınla çelişen bir yemeği önermeyiz, içerebilecek olanları da işaretleriz."),
+                    ("Uygunluk kontrolü", "Belirli bir mekanı sorduğunda, çalışma saatleri, çocuklara uygunluk, fiyat seviyesi gibi doğrulanabilir bilgilerle senin tercihlerini karşılaştırıp dürüst bir değerlendirme veririz — artılar, eksiler ve gitmeden önce sorman gerekenler.")
+                },
+                "Önce tercihlerini ayarla",
+                "Alerjilerini, diyet kısıtlarını, sevdiğin ve sevmediğin şeyleri bir kez kaydet; üç akış da bunları okur. Böylece her seferinde baştan anlatmak zorunda kalmazsın. Alerji ve diyet bilgisi ayrıca bir güvenlik kuralı: menü taramada bunlarla çelişen yemekler önerilerden çıkarılır.",
+                "Tercihlerini ayarla",
+                "Free plan her ay 5 yemek kararı içerir. Restoran bulmak, bir menü taramak veya bir mekanın uygunluğunu kontrol etmek birer karar sayılır. Bir şey ters giderse o hakkı geri veririz."),
+            "de" => (
+                "So funktioniert es",
+                new[]
+                {
+                    ("Restaurant finden", "Beschreibe in eigenen Worten, was du willst: „ruhiges Abendessen mit Kindern, nicht zu teuer“. Wir verbinden Ort, Stimmung und Vorlieben zu drei entscheidungsreifen Vorschlägen – mit Begründung, nicht als Filterliste."),
+                    ("Speisekarte scannen", "Fotografiere im Restaurant die Karte. Wir lesen sie und heben passende Gerichte hervor. Was einer Allergie oder Ernährungseinschränkung widerspricht, empfehlen wir nicht, und was sie enthalten könnte, markieren wir."),
+                    ("Passt-es-Check", "Fragst du nach einem bestimmten Ort, vergleichen wir überprüfbare Angaben wie Öffnungszeiten, Eignung für Kinder und Preisniveau mit deinen Vorlieben – mit Vorteilen, Nachteilen und Fragen, die du vorher klären solltest.")
+                },
+                "Stelle zuerst deine Vorlieben ein",
+                "Hinterlege einmal Allergien, Ernährungseinschränkungen und was du magst oder meidest. Alle drei Abläufe lesen sie, sodass du es nicht jedes Mal wiederholen musst. Allergien und Einschränkungen sind zusätzlich eine Sicherheitsregel: beim Scannen werden widersprechende Gerichte aus den Vorschlägen entfernt.",
+                "Vorlieben einstellen",
+                "Der Free Plan enthält 5 Essensentscheidungen pro Monat. Einen Ort finden, eine Karte scannen oder die Passung prüfen zählt je als eine Entscheidung. Geht etwas schief, schreiben wir sie dir zurück."),
+            _ => (
+                "How it works",
+                new[]
+                {
+                    ("Find a restaurant", "Describe what you want in your own words: “quiet dinner with the kids, nothing too pricey”. We combine your location, mood and preferences into three decision-ready picks, each with a reason, not a filter list."),
+                    ("Scan a menu", "At the table, photograph the menu. We read it and surface the dishes that suit you. Anything that conflicts with an allergy or dietary limit is not suggested, and anything that might contain one is flagged."),
+                    ("Fit check", "Ask about a specific place and we weigh verifiable details such as opening hours, suitability for kids and price level against your preferences, then answer honestly: what works, what to watch, and what to ask before you go.")
+                },
+                "Set your preferences first",
+                "Save your allergies, dietary limits and what you like or avoid once, and all three flows read them, so you never have to repeat yourself. Allergies and dietary limits are also a safety rule: in menu scanning, conflicting dishes are removed from the suggestions.",
+                "Set your preferences",
+                "The Free plan includes 5 dining decisions each month. Finding a place, scanning a menu, or checking a place's fit each count as one. If something goes wrong on our side, we give the decision back.")
+        };
+
+        var stepsHtml = string.Join("", steps.Select((step, index) => $"""
+        <tr>
+          <td style="padding:14px 0;border-top:1px solid #eadfd2">
+            <p style="margin:0 0 5px;font-size:15px;line-height:1.4;color:#19140f;font-weight:700">{index + 1}. {WebUtility.HtmlEncode(step.Item1)}</p>
+            <p style="margin:0;font-size:14px;line-height:1.6;color:#4b5563">{WebUtility.HtmlEncode(step.Item2)}</p>
+          </td>
+        </tr>
+        """));
+
+        // Rendered as a plain paragraph when no app URL is configured, so the guidance survives without a link.
+        var prefsCtaHtml = string.IsNullOrWhiteSpace(preferencesUrl)
+            ? ""
+            : $"""<p style="margin:14px 0 0"><a href="{WebUtility.HtmlEncode(preferencesUrl)}" style="color:#8a5d2d;font-weight:700">{WebUtility.HtmlEncode(prefsCta)}</a></p>""";
+
+        var html = $"""
+        <p style="margin:26px 0 0;font-size:13px;line-height:1.4;color:#8a5d2d;font-weight:700">{WebUtility.HtmlEncode(stepsTitle)}</p>
+        <table role="presentation" width="100%" style="border-collapse:collapse;margin:6px 0 0">{stepsHtml}</table>
+        <div style="margin:26px 0 0;padding:18px 20px;border-radius:14px;background:#fdf3e2;border:1px solid #e6cfa4">
+          <p style="margin:0 0 6px;font-size:15px;line-height:1.4;color:#19140f;font-weight:700">{WebUtility.HtmlEncode(prefsTitle)}</p>
+          <p style="margin:0;font-size:14px;line-height:1.6;color:#4b5563">{WebUtility.HtmlEncode(prefsBody)}</p>
+          {prefsCtaHtml}
+        </div>
+        <p style="margin:22px 0 0;font-size:14px;line-height:1.6;color:#4b5563">{WebUtility.HtmlEncode(plan)}</p>
+        """;
+
+        var textLines = new List<string> { stepsTitle };
+        textLines.AddRange(steps.Select((step, index) => $"{index + 1}. {step.Item1}: {step.Item2}"));
+        textLines.Add(prefsTitle);
+        textLines.Add(prefsBody);
+        if (!string.IsNullOrWhiteSpace(preferencesUrl)) textLines.Add($"{prefsCta}: {preferencesUrl}");
+        textLines.Add(plan);
+        return (html, string.Join("\n\n", textLines));
     }
 
     public RenderedEmailTemplate RenderEmailVerification(EmailTemplateModel model)
@@ -4295,7 +4448,7 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
         return new RenderedEmailTemplate(subject, html, text);
     }
 
-    private static RenderedEmailTemplate Layout(string locale, string subject, string body, string note, (string Label, string Url)? action = null, string? customHtml = null, string? highlight = null)
+    private static RenderedEmailTemplate Layout(string locale, string subject, string body, string note, (string Label, string Url)? action = null, string? customHtml = null, string? highlight = null, string? customText = null)
     {
         var title = WebUtility.HtmlEncode(subject);
         var bodyHtml = string.Join("<br><br>", WebUtility.HtmlEncode(body).Split("\n\n"));
@@ -4327,10 +4480,13 @@ public sealed class EmailTemplateRenderer : IEmailTemplateRenderer
 </body>
 </html>
 """;
-        var text = action is null
-            ? $"{subject}\n\n{body}\n\n{note}"
-            : $"{subject}\n\n{body}\n\n{action.Value.Label}: {action.Value.Url}\n\n{note}";
-        return new RenderedEmailTemplate(subject, html, text);
+        // The plain-text part has to carry the same information as the HTML part, or a text-only client
+        // (and every spam filter that compares the two) sees a much emptier email.
+        var textParts = new List<string> { subject, body };
+        if (!string.IsNullOrWhiteSpace(customText)) textParts.Add(customText!);
+        if (action is not null) textParts.Add($"{action.Value.Label}: {action.Value.Url}");
+        textParts.Add(note);
+        return new RenderedEmailTemplate(subject, html, string.Join("\n\n", textParts));
     }
 }
 
@@ -4355,7 +4511,12 @@ public sealed class EmailNotificationService(
         }
 
         var appUrl = TrimEnd(emailOptions.Value.AppBaseUrl);
-        var rendered = templates.RenderWelcome(new EmailTemplateModel(user.PreferredLanguage, user.DisplayName, LinkUrl: string.IsNullOrWhiteSpace(appUrl) ? null : $"{appUrl}/app/find"));
+        var hasAppUrl = !string.IsNullOrWhiteSpace(appUrl);
+        var rendered = templates.RenderWelcome(new EmailTemplateModel(
+            user.PreferredLanguage,
+            user.DisplayName,
+            LinkUrl: hasAppUrl ? $"{appUrl}/app/find" : null,
+            PreferencesUrl: hasAppUrl ? appUrl + productOptions.Value.PreferencesUrlPath : null));
         var result = await sender.SendAsync(new EmailMessage(user.Email, rendered.Subject, rendered.HtmlBody, rendered.TextBody, EmailTemplateRenderer.NormalizeLocale(user.PreferredLanguage), new Dictionary<string, string> { ["template"] = "welcome" }), cancellationToken);
         existing.Status = result.Succeeded ? "sent" : "failed";
         existing.SentAt = result.Succeeded ? DateTimeOffset.UtcNow : null;
@@ -5089,10 +5250,14 @@ internal sealed class OpenAiRestaurantFitAnalyzer(
                 dislikedCuisines = context.TasteProfile?.DislikedCuisines ?? [],
                 favoriteCuisines = context.TasteProfile?.FavoriteCuisines ?? [],
                 spiceTolerance = context.TasteProfile?.SpiceTolerance,
+                // Drinks and a taste for local places are venue-level signals the metadata can speak to
+                // (servesBeer, servesWine, editorialSummary), so they belong in a fit judgement.
+                drinkPreferences = context.TasteProfile?.DrinkPreferences ?? [],
                 usuallyWithKids = context.DiningProfile?.UsuallyWithKids,
                 prefersQuietPlaces = context.DiningProfile?.PrefersQuietPlaces,
                 prefersOutdoor = context.DiningProfile?.PrefersOutdoor,
                 budgetSensitivity = context.DiningProfile?.BudgetSensitivity,
+                likesLocalExperiences = context.DiningProfile?.LikesLocalExperiences,
                 likesPremiumPlaces = context.DiningProfile?.LikesPremiumPlaces,
                 needsParking = context.DiningProfile?.NeedsParking,
                 needsAccessibility = context.DiningProfile?.NeedsAccessibility

@@ -229,7 +229,12 @@ public sealed record EmailTemplateModel(
     string? LinkUrl = null,
     int? ExpiresInMinutes = null,
     string? SenderEmail = null,
-    string? Message = null);
+    string? Message = null,
+    /// <summary>
+    /// Where a new diner sets their taste and dining preferences. The welcome email is the one moment we
+    /// can reasonably ask for them, and every AI flow reads them afterwards.
+    /// </summary>
+    string? PreferencesUrl = null);
 public sealed record MonthlyRecapPlaceEmailModel(string PlaceName, string Headline, string WhyThisPlace);
 public sealed record MonthlyRecapEmailModel(
     string Locale,
